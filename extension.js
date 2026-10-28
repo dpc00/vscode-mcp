@@ -23,6 +23,18 @@ function fileUri(p) {
     return vscode.Uri.file(p);
 }
 
+// JSON cannot carry VS Code objects, but built-in commands such as vscode.executeHoverProvider need them.
+// {"$uri": "c:\\a.txt" or "file:///c:/a.txt"}, {"$pos": [line, character]}, {"$range": [l1, c1, l2, c2]}.
+function reviveArg(arg) {
+    if (Array.isArray(arg)) return arg.map(reviveArg);
+    if (arg && typeof arg === 'object') {
+        if (typeof arg.$uri === 'string') return /^[a-z][a-z0-9+.-]+:\/\//i.test(arg.$uri) ? vscode.Uri.parse(arg.$uri) : fileUri(arg.$uri);
+        if (Array.isArray(arg.$pos) && arg.$pos.length === 2) return new vscode.Position(arg.$pos[0], arg.$pos[1]);
+        if (Array.isArray(arg.$range) && arg.$range.length === 4) return new vscode.Range(arg.$range[0], arg.$range[1], arg.$range[2], arg.$range[3]);
+    }
+    return arg;
+}
+
 function describeUri(uri) {
     if (!uri) return null;
     return uri.scheme === 'file' ? uri.fsPath : uri.toString();
@@ -129,11 +141,15 @@ const TOOLS = [
     },
     {
         name: 'run_command',
-        description: 'Runs a VS Code command by id with optional arguments, like choosing it from the command palette. Returns the command result (JSON) or an error.',
+        description: 'Runs a VS Code command by id with optional arguments, like choosing it from the command palette. Returns the command result (JSON, capped) or an error. Arguments that need VS Code objects are written as {"$uri": "c:\\\\a.txt"}, {"$pos": [line, character]} and {"$range": [l1, c1, l2, c2]}, e.g. vscode.executeHoverProvider with [{"$uri": "..."}, {"$pos": [0, 5]}].',
         inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array' } }, required: ['command'] },
         run: async (a) => {
-            const result = await vscode.commands.executeCommand(a.command, ...(a.args || []));
-            return { ok: true, result: result === undefined ? null : result };
+            const result = await vscode.commands.executeCommand(a.command, ...(a.args || []).map(reviveArg));
+            if (result === undefined) return { ok: true, result: null };
+            // Provider commands (completions, hover, symbols) return large objects: cap what goes back.
+            const text = JSON.stringify(result);
+            if (text && text.length > MAX_TEXT) return { ok: true, truncated: true, result: cap(text) };
+            return { ok: true, result };
         },
     },
     {
