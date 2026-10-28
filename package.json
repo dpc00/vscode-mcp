@@ -2,7 +2,7 @@
   "name": "vscode-mcp",
   "displayName": "VS Code MCP",
   "description": "Exposes VS Code's own commands, tabs, text and extensions to an agent over MCP, like sublime-mcp does for Sublime Text.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "dpc00",
   "license": "MIT",
   "engines": { "vscode": "^1.90.0" },

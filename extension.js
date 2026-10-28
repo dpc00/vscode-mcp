@@ -7,7 +7,7 @@ const http = require('http');
 const path = require('path');
 const { execFile } = require('child_process');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -233,6 +233,31 @@ const TOOLS = [
             const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath.toLowerCase() === String(a.path).toLowerCase());
             if (!doc) throw new Error('file is not open');
             return { ok: await doc.save() };
+        },
+    },
+    {
+        name: 'create_file',
+        description: 'Creates a text file (and its folders) with the given content. Refuses to replace an existing file unless overwrite is true. Writes to disk directly; open it afterwards with open_file.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, overwrite: { type: 'boolean' } }, required: ['path'] },
+        run: async (a) => {
+            if (!path.isAbsolute(String(a.path))) throw new Error('path must be absolute');
+            const uri = fileUri(a.path);
+            let exists = true;
+            try { await vscode.workspace.fs.stat(uri); } catch (e) { exists = false; }
+            if (exists && !a.overwrite) throw new Error('file exists; pass overwrite:true to replace it');
+            await vscode.workspace.fs.createDirectory(fileUri(path.dirname(String(a.path))));
+            const bytes = Buffer.from(String(a.content || ''), 'utf8');
+            await vscode.workspace.fs.writeFile(uri, bytes);
+            return { ok: true, path: describeUri(uri), bytes: bytes.length, replaced: exists };
+        },
+    },
+    {
+        name: 'reload_window',
+        description: 'Reloads the VS Code window (workbench.action.reloadWindow). The call answers first and the reload follows about half a second later, so the server restarts: wait several seconds, then call again. Use it after install_extension so a new extension becomes active.',
+        inputSchema: { type: 'object', properties: {} },
+        run: async () => {
+            setTimeout(() => { vscode.commands.executeCommand('workbench.action.reloadWindow'); }, 500);
+            return { ok: true, note: 'reloading in about 0.5 s; reconnect after a few seconds' };
         },
     },
     {
