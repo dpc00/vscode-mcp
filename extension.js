@@ -315,11 +315,15 @@ async function handleRpc(msg) {
 }
 
 function startServer(output) {
-    const port = vscode.workspace.getConfiguration('vscodeMcp').get('port', 9560);
+    const config = vscode.workspace.getConfiguration('vscodeMcp');
+    const port = config.get('port', 9560);
+    const bind = config.get('bind', '127.0.0.1');
     const srv = http.createServer((req, res) => {
-        // Loopback only, and no browser pages: a page on the web must not be able to drive the editor.
+        // No browser pages: a page on the web must not be able to drive the editor. A Host header that is a
+        // name other than localhost is refused (DNS rebinding needs a name); an IP address is accepted so
+        // that a bind other than loopback (a disposable sandbox) can be reached by IP.
         const host = String(req.headers.host || '');
-        if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host) || req.headers.origin) {
+        if (!/^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?$/i.test(host) || req.headers.origin) {
             res.writeHead(403).end('forbidden');
             return;
         }
@@ -355,10 +359,10 @@ function startServer(output) {
         statusItem.text = '$(error) MCP';
         statusItem.tooltip = 'vscode-mcp: ' + e.message;
     });
-    srv.listen(port, '127.0.0.1', () => {
-        output.appendLine('listening on http://127.0.0.1:' + port + '/mcp');
+    srv.listen(port, bind, () => {
+        output.appendLine('listening on http://' + bind + ':' + port + '/mcp');
         statusItem.text = '$(plug) MCP ' + port;
-        statusItem.tooltip = 'vscode-mcp listening on http://127.0.0.1:' + port + '/mcp';
+        statusItem.tooltip = 'vscode-mcp listening on http://' + bind + ':' + port + '/mcp';
     });
     return srv;
 }

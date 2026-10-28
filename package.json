@@ -16,6 +16,11 @@
     "configuration": {
       "title": "VS Code MCP",
       "properties": {
+        "vscodeMcp.bind": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Address the MCP server listens on. Leave on 127.0.0.1 except inside a disposable sandbox, where 0.0.0.0 lets the host reach it. Restart the server after changing it."
+        },
         "vscodeMcp.port": {
           "type": "number",
           "default": 9560,
