@@ -5,6 +5,7 @@
 const vscode = require('vscode');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const { execFile } = require('child_process');
 
 const VERSION = '0.2.0';
@@ -13,6 +14,7 @@ const MAX_BODY = 4 * 1024 * 1024;
 
 let server = null;
 let statusItem = null;
+let logDir = null; // this window's extension host log folder (parent of this extension's own log folder)
 
 function cap(text, limit) {
     const n = limit || MAX_TEXT;
@@ -252,6 +254,39 @@ const TOOLS = [
         },
     },
     {
+        name: 'activate_extension',
+        description: 'Forces an installed extension to activate now (whatever its activation events) and reports ok or the error it throws, with the time taken. Gives up after 30 s (timed_out:true; the extension may still be starting). A smoke test that an extension starts, not that its features work.',
+        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        run: async (a) => {
+            const ext = vscode.extensions.getExtension(a.id);
+            if (!ext) throw new Error('extension not installed or not visible yet (reload the window after install_extension)');
+            const t0 = Date.now();
+            if (ext.isActive) return { ok: true, already_active: true, ms: 0 };
+            try {
+                const done = await Promise.race([ext.activate().then(() => true), new Promise((r) => setTimeout(() => r(false), 30000))]);
+                return done ? { ok: true, active: ext.isActive, ms: Date.now() - t0 } : { ok: false, timed_out: true, ms: Date.now() - t0 };
+            } catch (e) {
+                return { ok: false, error: String((e && e.message) || e).slice(0, 500), ms: Date.now() - t0 };
+            }
+        },
+    },
+    {
+        name: 'read_log',
+        description: 'Reads this window\'s extension host log (default exthost.log; file may be another plain file name in the same folder, list:true shows the folder). Returns only lines matching pattern (a regular expression, default error|fail|exception, case-insensitive) from line from_line on (0-based), at most max lines (default 100). The result also gives total_lines, so a later call can pass from_line to see only new lines. Use it to find "Activating extension ... failed".',
+        inputSchema: { type: 'object', properties: { file: { type: 'string' }, pattern: { type: 'string' }, from_line: { type: 'number' }, max: { type: 'number' }, list: { type: 'boolean' } } },
+        run: async (a) => {
+            if (!logDir) throw new Error('log folder unknown');
+            if (a.list) return { dir: logDir, files: fs.readdirSync(logDir) };
+            const file = path.join(logDir, path.basename(String(a.file || 'exthost.log')));
+            const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+            const re = new RegExp(a.pattern || 'error|fail|exception', 'i');
+            const hits = [];
+            for (let i = a.from_line || 0; i < lines.length; i++) if (re.test(lines[i])) hits.push(i + ': ' + lines[i]);
+            const max = a.max || 100;
+            return { file, total_lines: lines.length, matches: hits.length, lines: cap(hits.slice(-max).join('\n')) };
+        },
+    },
+    {
         name: 'reload_window',
         description: 'Reloads the VS Code window (workbench.action.reloadWindow). The call answers first and the reload follows about half a second later, so the server restarts: wait several seconds, then call again. Use it after install_extension so a new extension becomes active.',
         inputSchema: { type: 'object', properties: {} },
@@ -416,6 +451,7 @@ function startServer(output) {
 }
 
 function activate(context) {
+    logDir = path.dirname(context.logUri.fsPath);
     const output = vscode.window.createOutputChannel('VS Code MCP');
     statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 0);
     statusItem.show();
