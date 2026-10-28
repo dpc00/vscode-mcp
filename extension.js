@@ -81,8 +81,15 @@ function extInfo(ext) {
 // Runs VS Code's own command-line interface (the same cli.js that bin/code.cmd starts) and returns its output.
 function runCli(cliArgs) {
     const cli = path.join(vscode.env.appRoot, 'out', 'cli.js');
+    // The CLI installs into its own default folders unless told where this window keeps its extensions.
+    const config = vscode.workspace.getConfiguration('vscodeMcp');
+    const dirs = [];
+    const extensionsDir = config.get('extensionsDir', '');
+    const userDataDir = config.get('userDataDir', '');
+    if (extensionsDir) dirs.push('--extensions-dir=' + extensionsDir);
+    if (userDataDir) dirs.push('--user-data-dir=' + userDataDir);
     return new Promise((resolve, reject) => {
-        execFile(process.execPath, [cli, '--ms-enable-electron-run-as-node', ...cliArgs],
+        execFile(process.execPath, [cli, '--ms-enable-electron-run-as-node', ...dirs, ...cliArgs],
             { env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }), timeout: 5 * 60 * 1000, windowsHide: true },
             (err, stdout, stderr) => {
                 const text = String(stdout || '') + String(stderr || '');

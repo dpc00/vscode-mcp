@@ -25,6 +25,16 @@
           "type": "number",
           "default": 9560,
           "description": "Loopback port of the MCP server (http://127.0.0.1:<port>/mcp). Restart the server after changing it."
+        },
+        "vscodeMcp.extensionsDir": {
+          "type": "string",
+          "default": "",
+          "description": "Extensions folder this VS Code was started with (--extensions-dir). install_extension and uninstall_extension pass it to VS Code's CLI; empty means the CLI's own default, which is wrong when VS Code runs with a different folder."
+        },
+        "vscodeMcp.userDataDir": {
+          "type": "string",
+          "default": "",
+          "description": "User data folder this VS Code was started with (--user-data-dir), passed to VS Code's CLI the same way. Empty means the CLI's default."
         }
       }
     }
