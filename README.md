@@ -16,7 +16,7 @@ Port: setting `vscodeMcp.port`. The server accepts only loopback hosts and refus
 
 ## Tools (v0.1)
 
-`get_help`, `list_commands`, `run_command` (any VS Code command), `get_open_files`, `get_workspace_folders`, `get_active_file`, `get_text`, `open_file`, `replace_text`, `save_file`, `create_file` (new text file, refuses to overwrite unless told), `reload_window` (answers first, reloads half a second later), `activate_extension` (forces one extension to start and reports the error it throws, 30 s limit), `read_log` (error lines of the extension host log, or any file in that log folder), `close_file` (by path, name or group+index only), `get_diagnostics`, `list_extensions`, `install_extension`, `uninstall_extension`, `show_message`.
+`get_help`, `list_commands`, `run_command` (any VS Code command), `get_open_files`, `get_workspace_folders`, `get_active_file`, `get_text`, `open_file`, `replace_text`, `save_file`, `create_file` (new text file, refuses to overwrite unless told), `reload_window` (answers first, reloads half a second later), `activate_extension` (forces one extension to start and reports the error it throws, 30 s limit), `read_log` (error lines of the extension host log, or any file in that log folder), `close_file` (by path, name or group+index only), `get_diagnostics`, `list_extensions`, `install_extension` and `uninstall_extension` (one `id` or a list `ids`: one CLI process for the whole list, with ok and version per id), `show_message`.
 
 ## Known gaps (found while building it)
 

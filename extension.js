@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -35,6 +35,10 @@ function reviveArg(arg) {
         if (Array.isArray(arg.$range) && arg.$range.length === 4) return new vscode.Range(arg.$range[0], arg.$range[1], arg.$range[2], arg.$range[3]);
     }
     return arg;
+}
+
+function escapeRe(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function describeUri(uri) {
@@ -334,19 +338,35 @@ const TOOLS = [
     {
         name: 'install_extension',
         description: 'Installs an extension from the marketplace by id (publisher.name) with VS Code\'s own CLI. The command "workbench.extensions.installExtension" is not used: it opens a "Do you trust the publisher?" dialog that nothing can answer. The running window may list the new extension only after a reload (run_command workbench.action.reloadWindow).',
-        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids installed by ONE CLI process (much faster than one call each); results holds ok and version per id.' } } },
         run: async (a) => {
-            const out = await runCli(['--install-extension', a.id, '--force']);
-            return { ok: /successfully installed/i.test(out), cli: out.trim(), visible_now: !!vscode.extensions.getExtension(a.id) };
+            const ids = a.ids && a.ids.length ? a.ids.map(String) : (a.id ? [String(a.id)] : []);
+            if (!ids.length) throw new Error('give id or ids');
+            const args = [];
+            for (const id of ids) args.push('--install-extension', id);
+            args.push('--force');
+            const out = await runCli(args);
+            const results = {};
+            for (const id of ids) {
+                const m = new RegExp("Extension '" + escapeRe(id) + "' v([^ ]+) was successfully installed", 'i').exec(out);
+                results[id] = { ok: !!m, version: m ? m[1] : '', visible_now: !!vscode.extensions.getExtension(id) };
+            }
+            return { ok: ids.every((id) => results[id].ok), results, cli: out.trim(), visible_now: ids.length === 1 ? results[ids[0]].visible_now : undefined };
         },
     },
     {
         name: 'uninstall_extension',
         description: 'Uninstalls an extension by id with VS Code\'s own CLI. The running window may keep it listed until a reload.',
-        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids removed by ONE CLI process.' } } },
         run: async (a) => {
-            const out = await runCli(['--uninstall-extension', a.id]);
-            return { ok: /successfully uninstalled/i.test(out), cli: out.trim(), still_listed: !!vscode.extensions.getExtension(a.id) };
+            const ids = a.ids && a.ids.length ? a.ids.map(String) : (a.id ? [String(a.id)] : []);
+            if (!ids.length) throw new Error('give id or ids');
+            const args = [];
+            for (const id of ids) args.push('--uninstall-extension', id);
+            const out = await runCli(args);
+            const results = {};
+            for (const id of ids) results[id] = { ok: new RegExp("Extension '" + escapeRe(id) + "' was successfully uninstalled", 'i').test(out), still_listed: !!vscode.extensions.getExtension(id) };
+            return { ok: ids.every((id) => results[id].ok), results, cli: out.trim(), still_listed: ids.length === 1 ? results[ids[0]].still_listed : undefined };
         },
     },
     {
