@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -392,7 +392,7 @@ const TOOLS = [
         run: async (a) => {
             const sev = ['error', 'warning', 'info', 'hint'];
             const src = a.source ? new RegExp(a.source, 'i') : null;
-            const shape = (uri, list) => list.filter(d => !src || src.test(d.source || '')).map(d => ({ path: describeUri(uri), line: d.range.start.line, severity: sev[d.severity], source: d.source, message: d.message }));
+            const shape = (uri, list) => list.filter(d => !src || src.test(d.source || '')).map(d => ({ path: describeUri(uri), line: d.range.start.line, character: d.range.start.character, end_line: d.range.end.line, end_character: d.range.end.character, severity: sev[d.severity], source: d.source, code: d.code && typeof d.code === 'object' ? d.code.value : d.code, message: d.message }));
             if (a.path) return shape(fileUri(a.path), vscode.languages.getDiagnostics(fileUri(a.path)));
             const out = [];
             for (const [uri, list] of vscode.languages.getDiagnostics()) out.push(...shape(uri, list));
