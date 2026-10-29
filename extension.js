@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -203,12 +203,12 @@ const TOOLS = [
     {
         name: 'open_file',
         description: 'Opens a file in an editor tab (optionally at a 0-based line), without taking over an existing preview tab.',
-        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' } }, required: ['path'] },
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' } }, required: ['path'] },
         run: async (a) => {
             const doc = await vscode.workspace.openTextDocument(fileUri(a.path));
             const ed = await vscode.window.showTextDocument(doc, { preview: false });
             if (a.line !== undefined) {
-                const p = posOf(doc, a.line, 0);
+                const p = posOf(doc, a.line, a.character || 0);
                 ed.selection = new vscode.Selection(p, p);
                 ed.revealRange(new vscode.Range(p, p));
             }
@@ -255,6 +255,79 @@ const TOOLS = [
             const bytes = Buffer.from(String(a.content || ''), 'utf8');
             await vscode.workspace.fs.writeFile(uri, bytes);
             return { ok: true, path: describeUri(uri), bytes: bytes.length, replaced: exists };
+        },
+    },
+    {
+        name: 'complete',
+        description: 'Completions at a position (path, 0-based line and character), without the 20000-character cap of run_command: returns total, then at most limit (default 50) items as label, description, kind, detail, insert. filter is a case-insensitive regular expression on the label, applied before the limit. trigger is an optional trigger character.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' }, filter: { type: 'string' }, limit: { type: 'number' }, trigger: { type: 'string' } }, required: ['path'] },
+        run: async (a) => {
+            const uri = fileUri(a.path);
+            await vscode.workspace.openTextDocument(uri);
+            const list = await vscode.commands.executeCommand('vscode.executeCompletionItemProvider', uri, new vscode.Position(a.line || 0, a.character || 0), a.trigger);
+            const re = a.filter ? new RegExp(a.filter, 'i') : null;
+            let items = ((list && list.items) || []).map((i) => {
+                const obj = typeof i.label === 'object' && i.label;
+                const ins = i.insertText && typeof i.insertText === 'object' ? i.insertText.value : i.insertText;
+                return { label: obj ? obj.label : i.label, description: obj ? obj.description : undefined, kind: vscode.CompletionItemKind[i.kind], detail: i.detail, insert: ins };
+            });
+            if (re) items = items.filter((i) => re.test(i.label));
+            return { total: items.length, items: items.slice(0, a.limit || 50) };
+        },
+    },
+    {
+        name: 'hover',
+        description: 'Hover text at a position (path, 0-based line and character): the markdown/plain strings of every hover provider, joined.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' } }, required: ['path'] },
+        run: async (a) => {
+            const uri = fileUri(a.path);
+            await vscode.workspace.openTextDocument(uri);
+            const hovers = (await vscode.commands.executeCommand('vscode.executeHoverProvider', uri, new vscode.Position(a.line || 0, a.character || 0))) || [];
+            const parts = [];
+            for (const h of hovers) for (const c of [].concat(h.contents)) parts.push(typeof c === 'string' ? c : c.value);
+            return { hovers: hovers.length, text: cap(parts.join('\n---\n')) };
+        },
+    },
+    {
+        name: 'definitions',
+        description: 'Go to definition at a position (path, 0-based line and character): the target locations as path, line, character.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' } }, required: ['path'] },
+        run: async (a) => {
+            const uri = fileUri(a.path);
+            await vscode.workspace.openTextDocument(uri);
+            const found = (await vscode.commands.executeCommand('vscode.executeDefinitionProvider', uri, new vscode.Position(a.line || 0, a.character || 0))) || [];
+            return found.map((l) => { const u = l.uri || l.targetUri; const r = l.range || l.targetSelectionRange || l.targetRange; return { path: describeUri(u), line: r.start.line, character: r.start.character }; });
+        },
+    },
+    {
+        name: 'insert_text',
+        description: 'Inserts text at a position (path, 0-based line and character; default end of file) in a file, opening it if needed. Does not save. Use to type a prefix before asking for completions.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' } }, required: ['path', 'text'] },
+        run: async (a) => {
+            const doc = await vscode.workspace.openTextDocument(fileUri(a.path));
+            const at = a.line === undefined ? doc.lineAt(doc.lineCount - 1).range.end : posOf(doc, a.line, a.character || 0);
+            const edit = new vscode.WorkspaceEdit();
+            edit.insert(doc.uri, at, a.text);
+            const ok = await vscode.workspace.applyEdit(edit);
+            return { ok, line: at.line, character: at.character, dirty: doc.isDirty };
+        },
+    },
+    {
+        name: 'batch',
+        description: 'Runs several tool calls in order in ONE request and returns one result per call: calls is a list of {tool, arguments} or {sleep: milliseconds}. Stops at the first error unless keep_going is true. Saves the round trip of every step of a test (create, open, edit, complete, diagnostics).',
+        inputSchema: { type: 'object', properties: { calls: { type: 'array', items: { type: 'object' } }, keep_going: { type: 'boolean' } }, required: ['calls'] },
+        run: async (a) => {
+            const results = [];
+            for (const c of a.calls || []) {
+                if (c && typeof c.sleep === 'number') { await new Promise((r) => setTimeout(r, Math.min(c.sleep, 30000))); results.push({ slept: c.sleep }); continue; }
+                const tool = TOOLS.find((t) => t.name === (c && c.tool));
+                if (!tool || tool.name === 'batch' || tool.name === 'reload_window') { results.push({ error: 'cannot batch tool ' + (c && c.tool) }); if (!a.keep_going) break; continue; }
+                try { results.push(await tool.run((c && c.arguments) || {})); } catch (e) {
+                    results.push({ error: String((e && e.message) || e) });
+                    if (!a.keep_going) break;
+                }
+            }
+            return results;
         },
     },
     {
@@ -315,10 +388,11 @@ const TOOLS = [
     {
         name: 'get_diagnostics',
         description: 'Problems (errors, warnings) for a file, or for all files when path is omitted.',
-        inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, source: { type: 'string', description: 'keep only diagnostics whose source matches this case-insensitive regular expression' } } },
         run: async (a) => {
             const sev = ['error', 'warning', 'info', 'hint'];
-            const shape = (uri, list) => list.map(d => ({ path: describeUri(uri), line: d.range.start.line, severity: sev[d.severity], source: d.source, message: d.message }));
+            const src = a.source ? new RegExp(a.source, 'i') : null;
+            const shape = (uri, list) => list.filter(d => !src || src.test(d.source || '')).map(d => ({ path: describeUri(uri), line: d.range.start.line, severity: sev[d.severity], source: d.source, message: d.message }));
             if (a.path) return shape(fileUri(a.path), vscode.languages.getDiagnostics(fileUri(a.path)));
             const out = [];
             for (const [uri, list] of vscode.languages.getDiagnostics()) out.push(...shape(uri, list));
@@ -328,11 +402,12 @@ const TOOLS = [
     {
         name: 'list_extensions',
         description: 'Lists installed extensions (id, version, active, builtin), optionally filtered by id substring. Built-in ones are hidden unless builtin is true.',
-        inputSchema: { type: 'object', properties: { filter: { type: 'string' }, builtin: { type: 'boolean' } } },
+        inputSchema: { type: 'object', properties: { filter: { type: 'string' }, builtin: { type: 'boolean' }, active_only: { type: 'boolean' }, ids_only: { type: 'boolean', description: 'return just the id strings' } } },
         run: async (a) => {
             const f = a.filter ? String(a.filter).toLowerCase() : '';
-            return vscode.extensions.all.map(extInfo)
-                .filter(e => (a.builtin || !e.builtin) && e.id.toLowerCase().includes(f));
+            const list = vscode.extensions.all.map(extInfo)
+                .filter(e => (a.builtin || !e.builtin) && e.id.toLowerCase().includes(f) && (!a.active_only || e.active));
+            return a.ids_only ? list.map(e => e.id) : list;
         },
     },
     {
@@ -408,7 +483,7 @@ async function handleRpc(msg) {
         if (!tool) return rpcError(id, -32602, 'unknown tool ' + (params && params.name));
         try {
             const value = await tool.run((params && params.arguments) || {});
-            return ok(id, { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 1) }] });
+            return ok(id, { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] });
         } catch (e) {
             return ok(id, { isError: true, content: [{ type: 'text', text: String((e && e.message) || e) }] });
         }
