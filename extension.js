@@ -380,6 +380,18 @@ const TOOLS = [
             if (!a.path && !a.name && a.index === undefined) throw new Error('give path, name, or group and index');
             const tab = findTab(a);
             if (tab.isDirty && !a.discard) throw new Error('tab has unsaved changes; save it or pass discard:true');
+            if (tab.isDirty && a.discard) {
+                // tabGroups.close cannot discard: a dirty tab raises VS Code's native
+                // save dialog, which blocks the workbench behind the MCP call (found
+                // 2026-11-11 in the extension audit). Revert the editor first, then
+                // the close is silent.
+                const uri = tab.input && tab.input.uri;
+                if (uri) {
+                    const ed = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+                    if (!ed) await vscode.window.showTextDocument(uri, { preview: false });
+                    await vscode.commands.executeCommand('workbench.action.files.revert');
+                }
+            }
             const label = tab.label;
             const ok = await vscode.window.tabGroups.close(tab, true);
             return { ok, closed: label };
