@@ -6,9 +6,9 @@ const vscode = require('vscode');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
+const { execFile, exec } = require('child_process');
 
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -310,6 +310,71 @@ const TOOLS = [
             edit.insert(doc.uri, at, a.text);
             const ok = await vscode.workspace.applyEdit(edit);
             return { ok, line: at.line, character: at.character, dirty: doc.isDirty };
+        },
+    },
+    {
+        name: 'run_shell',
+        description: 'Runs a shell command on this machine from inside the extension host and returns exit code, stdout and stderr (each capped). cwd defaults to the first workspace folder. Use it to read files a program wrote, run the program under test, or copy a probe around without a separate terminal round trip. timeout_ms default 30000.',
+        inputSchema: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string' }, timeout_ms: { type: 'number' } }, required: ['command'] },
+        run: (a) => new Promise((resolve) => {
+            const folders = vscode.workspace.workspaceFolders;
+            const cwd = a.cwd || (folders && folders.length ? folders[0].uri.fsPath : undefined);
+            const started = Date.now();
+            exec(String(a.command), {
+                cwd,
+                timeout: Math.min(a.timeout_ms || 30000, 300000),
+                maxBuffer: 8 * 1024 * 1024,
+                windowsHide: true,
+            }, (err, stdout, stderr) => {
+                const out = {
+                    code: err && typeof err.code === 'number' ? err.code : (err ? null : 0),
+                    stdout: cap(String(stdout || '')),
+                    stderr: cap(String(stderr || '')),
+                    ms: Date.now() - started,
+                };
+                if (err && err.killed) out.timed_out = true;
+                if (err && typeof err.code !== 'number' && !err.killed) out.error = String(err.message || err).slice(0, 500);
+                resolve(out);
+            });
+        }),
+    },
+    {
+        name: 'wait_for',
+        description: 'Waits until a file exists, contains text, or is absent (absent:true) - no fixed sleeps. Polls every interval_ms (default 150) up to timeout_ms (default 10000). Put it between an action and get_text in one batch: the test continues the moment the effect lands.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, contains: { type: 'string' }, absent: { type: 'boolean' }, timeout_ms: { type: 'number' }, interval_ms: { type: 'number' } }, required: ['path'] },
+        run: async (a) => {
+            const started = Date.now();
+            const timeout = Math.min(a.timeout_ms || 10000, 120000);
+            const interval = Math.max(a.interval_ms || 150, 20);
+            for (;;) {
+                let exists = false;
+                let text = '';
+                try { text = fs.readFileSync(String(a.path), 'utf8'); exists = true; } catch (e) { exists = false; }
+                let ok;
+                if (a.absent) ok = !exists;
+                else ok = exists && (a.contains ? text.includes(String(a.contains)) : true);
+                if (ok) return { ok: true, waited_ms: Date.now() - started, exists, chars: exists ? text.length : 0 };
+                if (Date.now() - started >= timeout) return { ok: false, timed_out: true, waited_ms: Date.now() - started, exists, chars: exists ? text.length : 0 };
+                await new Promise((r) => setTimeout(r, interval));
+            }
+        },
+    },
+    {
+        name: 'wait_config',
+        description: 'Waits until a setting has a given value (JSON compare), so a settings.json write can be followed straight by the test instead of a 3-4 s sleep for the watcher. key is the full dotted key, e.g. code-runner.ignoreSelection; value is any JSON value, null to wait for unset.',
+        inputSchema: { type: 'object', properties: { key: { type: 'string' }, value: {}, timeout_ms: { type: 'number' } }, required: ['key'] },
+        run: async (a) => {
+            const started = Date.now();
+            const timeout = Math.min(a.timeout_ms || 10000, 120000);
+            const want = JSON.stringify(a.value === undefined ? null : a.value);
+            for (;;) {
+                const actual = vscode.workspace.getConfiguration().get(a.key);
+                if (JSON.stringify(actual === undefined ? null : actual) === want) {
+                    return { ok: true, waited_ms: Date.now() - started, value: actual };
+                }
+                if (Date.now() - started >= timeout) return { ok: false, timed_out: true, waited_ms: Date.now() - started, actual };
+                await new Promise((r) => setTimeout(r, 100));
+            }
         },
     },
     {
