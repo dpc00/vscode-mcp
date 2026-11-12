@@ -7,8 +7,9 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
+const os = require('os');
 
-const VERSION = '0.8.3';
+const VERSION = '0.8.4';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -633,6 +634,105 @@ const TOOLS = [
             const label = tab.label;
             const ok = await vscode.window.tabGroups.close(tab, true);
             return { ok, closed: label };
+        },
+    },
+    {
+        name: 'self_test',
+        description: 'Runs a battery of checks against the running VS Code build and this server: version and command count, create_file/get_text/replace_text/expect round trip, open_file/get_active_file, save_file/close_file, run_command dispatch, completions, list_dialogs (the FFI dialog layer), get_diagnostics and a nested batch. Run it after a VS Code update: one call says which capabilities still work, instead of a wrong assumption surfacing halfway through a test round.',
+        inputSchema: { type: 'object', properties: {} },
+        run: async () => {
+            const by = new Map(TOOLS.map((t) => [t.name, t]));
+            const dir = path.join(os.tmpdir(), 'vscode-mcp-self-test-' + process.pid);
+            const f = path.join(dir, 'probe.txt');
+            const js = path.join(dir, 'probe.js');
+            const checks = [];
+            const must = (cond, what) => { if (!cond) throw new Error(what); };
+            const check = async (name, fn) => {
+                const t0 = Date.now();
+                try {
+                    const detail = await fn();
+                    checks.push({ name, ok: true, ms: Date.now() - t0, detail });
+                } catch (e) {
+                    checks.push({ name, ok: false, ms: Date.now() - t0, error: String((e && e.message) || e) });
+                }
+            };
+            await check('version', async () => {
+                const cmds = await vscode.commands.getCommands(true);
+                must(cmds.length > 500, 'only ' + cmds.length + ' commands');
+                return vscode.version + ', ' + cmds.length + ' commands';
+            });
+            await check('create_file', async () => {
+                const r = await by.get('create_file').run({ path: f, content: 'one two three', overwrite: true });
+                must(r && r.ok, 'create_file failed: ' + JSON.stringify(r));
+                return r.bytes + ' bytes';
+            });
+            await check('get_text', async () => {
+                const r = await by.get('get_text').run({ path: f });
+                must(r && r.text === 'one two three', 'text mismatch: ' + JSON.stringify(r && r.text));
+                return 'round trip';
+            });
+            await check('replace_text + expect', async () => {
+                await by.get('replace_text').run({ path: f, old_string: 'one', new_string: 'zero' });
+                const r = await by.get('expect').run({ path: f, equals: 'zero two three' });
+                must(r && r.ok, 'expect failed: ' + JSON.stringify(r && r.first_difference));
+                return 'pass';
+            });
+            await check('open_file + get_active_file', async () => {
+                await by.get('open_file').run({ path: f });
+                await sleep(200);
+                const r = await by.get('get_active_file').run({ max: 1 });
+                must(r && r.path && r.path.toLowerCase().endsWith('probe.txt'), 'wrong active file: ' + (r && r.path));
+                return r.language;
+            });
+            await check('save_file', async () => {
+                const r = await by.get('save_file').run({ path: f });
+                must(r && typeof r.ok === 'boolean', 'save_file did not answer: ' + JSON.stringify(r));
+                return r.ok ? 'saved' : 'not dirty';
+            });
+            await check('run_command', async () => {
+                const r = await by.get('run_command').run({ command: 'editor.action.selectAll' });
+                must(r && !r.pending && r.ok, 'run_command failed: ' + JSON.stringify(r).slice(0, 160));
+                return 'dispatched';
+            });
+            await check('complete', async () => {
+                await by.get('create_file').run({ path: js, content: 'const v = 1;\n', overwrite: true });
+                await by.get('open_file').run({ path: js, line: 0, character: 6 });
+                await sleep(300);
+                const r = await by.get('complete').run({ path: js, line: 0, character: 6, limit: 5 });
+                must(r && Array.isArray(r.items), 'no completion items array: ' + JSON.stringify(r).slice(0, 160));
+                return r.items.length + ' items';
+            });
+            await check('list_dialogs', async () => {
+                const r = await by.get('list_dialogs').run({});
+                must(r && Array.isArray(r.dialogs) && !r.error, 'list_dialogs failed: ' + JSON.stringify(r).slice(0, 160));
+                return r.dialogs.length + ' open';
+            });
+            await check('get_diagnostics', async () => {
+                const r = await by.get('get_diagnostics').run({ path: f });
+                must(Array.isArray(r), 'diagnostics not an array: ' + JSON.stringify(r).slice(0, 160));
+                return r.length + ' diagnostics';
+            });
+            await check('batch', async () => {
+                const r = await by.get('batch').run({ calls: [{ tool: 'get_help', arguments: {} }] });
+                must(Array.isArray(r) && r.length === 1 && r[0] && r[0].server, 'batch failed: ' + JSON.stringify(r).slice(0, 160));
+                return 'nested call ok';
+            });
+            await check('close + cleanup', async () => {
+                try { await by.get('close_file').run({ path: js, discard: true }); } catch (e) {}
+                try { await by.get('close_file').run({ path: f, discard: true }); } catch (e) {}
+                try { await vscode.workspace.fs.delete(vscode.Uri.file(dir), { recursive: true }); } catch (e) {}
+                return 'fixtures removed';
+            });
+            const failed = checks.filter((c) => !c.ok);
+            return {
+                vscode: vscode.version,
+                pass: checks.length - failed.length,
+                fail: failed.length,
+                checks,
+                note: failed.length
+                    ? 'a failed check names the capability that changed with this editor build'
+                    : 'all capabilities present',
+            };
         },
     },
     {
