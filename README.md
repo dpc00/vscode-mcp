@@ -4,6 +4,8 @@ An MCP server inside VS Code, like [sublime-mcp](https://github.com/dpc00/sublim
 
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue)](https://www.paypal.me/DChitester)
 
+Contact: donaldchitester@gmail.com
+
 ## Run it
 
 Development mode, nothing installed into VS Code:
