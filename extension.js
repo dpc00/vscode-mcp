@@ -194,6 +194,12 @@ function psDismiss(targetHwnd, msg) {
 
 const CANCEL_RE = /cancel|no\b|don.?t save|close|discard/i;
 
+// Observed behaviour of VS Code commands, recorded by tools/probe_vscode_commands.js on a
+// disposable profile and shipped beside the extension. When present, each generated command
+// tool's description gains an "Observed on VS Code ..." line (the sublime-commander pattern).
+let COMMAND_BEHAVIOR = null;
+try { COMMAND_BEHAVIOR = JSON.parse(fs.readFileSync(path.join(__dirname, 'commands_behavior.json'), 'utf8')); } catch (e) {}
+
 const TOOLS = [
     {
         name: 'get_help',
@@ -815,11 +821,18 @@ async function buildCommandTools() {
     const out = [];
     for (const id of ids) {
         const name = commandToolName(id, used);
+        let description = 'VS Code command `' + id + '` (generated from this window\'s command list; dispatched as-is, like run_command). Pass {"args": [...]}; {"$uri"}, {"$pos"} and {"$range"} items revive to real VS Code objects.';
+        const b = COMMAND_BEHAVIOR && COMMAND_BEHAVIOR.commands ? COMMAND_BEHAVIOR.commands[id] : null;
+        if (b && b.note) {
+            description += ' Observed on VS Code ' + (COMMAND_BEHAVIOR.vscode || '') + ': ' + b.note;
+        } else if (b && b.outcome === 'ok') {
+            description += ' Observed on VS Code ' + (COMMAND_BEHAVIOR.vscode || '') + ': ran with no arguments and returned cleanly.';
+        }
         out.push({
             name,
             generated: true,
             commandId: id,
-            description: 'VS Code command `' + id + '` (generated from this window\'s command list; dispatched as-is, like run_command). Pass {"args": [...]}; {"$uri"}, {"$pos"} and {"$range"} items revive to real VS Code objects.',
+            description,
             inputSchema: { type: 'object', properties: { args: { type: 'array', description: 'Forwarded to the command unchanged, in run_command\'s {"args": [...]} shape.' } } },
             run: async (a) => {
                 const args = (a && Array.isArray(a.args) ? a.args : []).map(reviveArg);
