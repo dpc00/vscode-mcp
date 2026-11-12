@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -116,6 +116,83 @@ function runCli(cliArgs) {
             });
     });
 }
+
+// Native dialogs of THIS VS Code instance (main process + this extension host), found by
+// enumerating the OS windows whose class is #32770 - the class every standard Windows
+// dialog uses, and no VS Code editor window uses. Implemented in PowerShell (inline, no
+// native dependency): the same trick sublime-commander's dialog watcher uses, ported.
+const VSDLG_CS = `
+using System;using System.Runtime.InteropServices;using System.Text;
+public class VSDlg {
+  [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr after, string cls, string title);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+}`;
+const PS_PRELUDE = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n` + VSDLG_CS + `\n'@\n`;
+const PS_ENUM_DIALOGS = PS_PRELUDE + `
+$targets = $env:VSCODE_PIDS.Split(',') | ForEach-Object { [uint32]$_ }
+$found = @()
+$h = [VSDlg]::GetTopWindow([IntPtr]::Zero)
+while ($h -ne [IntPtr]::Zero) {
+  $wpid = [uint32]0
+  [void][VSDlg]::GetWindowThreadProcessId($h, [ref]$wpid)
+  if ($targets -contains $wpid -and [VSDlg]::IsWindowVisible($h)) {
+    $cn = New-Object System.Text.StringBuilder 256
+    [void][VSDlg]::GetClassName($h, $cn, 256)
+    if ($cn.ToString() -eq '#32770') {
+      $tt = New-Object System.Text.StringBuilder 512
+      [void][VSDlg]::GetWindowText($h, $tt, 512)
+      $buttons = @()
+      $b = [VSDlg]::FindWindowEx($h, [IntPtr]::Zero, 'Button', $null)
+      while ($b -ne [IntPtr]::Zero) {
+        $bt = New-Object System.Text.StringBuilder 256
+        [void][VSDlg]::GetWindowText($b, $bt, 256)
+        if ($bt.Length -gt 0) { $buttons += @{ hwnd = $b.ToInt64(); text = $bt.ToString() } }
+        $b = [VSDlg]::FindWindowEx($h, $b, 'Button', $null)
+      }
+      $found += @{ hwnd = $h.ToInt64(); pid = $wpid; title = $tt.ToString(); buttons = $buttons }
+    }
+  }
+  $h = [VSDlg]::GetWindow($h, 2)
+}
+if ($found.Count -eq 0) { '[]' } else { $found | ConvertTo-Json -Depth 3 -Compress }
+`;
+
+function dialogPids() {
+    // The main process (parent of this extension host) owns the native dialogs; this
+    // extension host owns none, but is included so nothing is missed.
+    const pids = [process.ppid, process.pid].filter((p) => Number.isFinite(p));
+    return pids.join(',');
+}
+
+function runPowerShell(script, timeoutMs) {
+    return new Promise((resolve) => {
+        execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+            { env: Object.assign({}, process.env, { VSCODE_PIDS: dialogPids() }), timeout: timeoutMs || 20000, windowsHide: true },
+            (err, stdout) => {
+                if (err && !String(stdout || '').trim()) { resolve({ error: String((err && err.message) || err).slice(0, 300) }); return; }
+                resolve({ stdout: String(stdout || '').trim() });
+            });
+    });
+}
+
+function parseDialogs(stdout) {
+    try {
+        const value = JSON.parse(stdout);
+        return Array.isArray(value) ? value : [value];
+    } catch (e) { return []; }
+}
+
+function psDismiss(targetHwnd, msg) {
+    return PS_PRELUDE + `\n[void][VSDlg]::PostMessage([IntPtr]::new(` + Number(targetHwnd) + `), ` + Number(msg) + `, [IntPtr]::Zero, [IntPtr]::Zero)\n'done'\n`;
+}
+
+const CANCEL_RE = /cancel|no\b|don.?t save|close|discard/i;
 
 const TOOLS = [
     {
@@ -507,6 +584,43 @@ const TOOLS = [
             const label = tab.label;
             const ok = await vscode.window.tabGroups.close(tab, true);
             return { ok, closed: label };
+        },
+    },
+    {
+        name: 'list_dialogs',
+        description: 'Lists the native OS dialogs (class #32770) of this VS Code instance: hwnd, title and the labelled buttons of each. This is the tool for "a dialog is up and nothing answers": file open/save dialogs, confirmations and message boxes of the editor itself. Empty list means no native dialog is up (workbench quick picks and input boxes are NOT visible to any API - they are recorded as a gap). Costs one PowerShell round trip, about 1-2 s.',
+        inputSchema: { type: 'object', properties: {} },
+        run: async () => {
+            const r = await runPowerShell(PS_ENUM_DIALOGS);
+            if (r.error) return { dialogs: [], error: r.error };
+            return { dialogs: parseDialogs(r.stdout) };
+        },
+    },
+    {
+        name: 'dismiss_dialog',
+        description: 'Closes a native dialog of this VS Code instance: clicks the button matching cancel_re (default /cancel|no|don.t save|close|discard/i - cancel is the safe answer), or sends WM_CLOSE when no labelled button matches. hwnd defaults to the first dialog from list_dialogs. Workbench quick picks and input boxes are not native dialogs - they are unreachable.',
+        inputSchema: { type: 'object', properties: { hwnd: { type: 'number' }, cancel_re: { type: 'string' } } },
+        run: async (a) => {
+            const enumOut = await runPowerShell(PS_ENUM_DIALOGS);
+            const dialogs = parseDialogs(enumOut.stdout || '[]');
+            if (!dialogs.length) return { ok: false, note: 'no native dialog is up' };
+            let dlg = dialogs[0];
+            if (a.hwnd !== undefined) {
+                const found = dialogs.find((d) => d.hwnd === Number(a.hwnd));
+                if (!found) return { ok: false, note: 'hwnd ' + a.hwnd + ' is not a dialog of this instance', dialogs };
+                dlg = found;
+            }
+            let re = CANCEL_RE;
+            if (a.cancel_re) {
+                try { re = new RegExp(a.cancel_re, 'i'); } catch (e) { return { ok: false, error: 'bad cancel_re: ' + e.message }; }
+            }
+            const cancel = (dlg.buttons || []).find((b) => re.test(b.text || ''));
+            if (cancel) {
+                const r = await runPowerShell(psDismiss(cancel.hwnd, 0x00F5));
+                return { ok: !r.error, via: 'button: ' + cancel.text, button_hwnd: cancel.hwnd, error: r.error };
+            }
+            const r = await runPowerShell(psDismiss(dlg.hwnd, 0x0010));
+            return { ok: !r.error, via: 'WM_CLOSE', hwnd: dlg.hwnd, error: r.error };
         },
     },
     {
