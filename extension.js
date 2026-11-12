@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -200,6 +200,35 @@ function postMessage(h, msg, wParam) {
     PostMessageW(h, msg, u32(wParam), 0);
 }
 
+// A command that opens a modal never returns until someone answers it, and the workbench
+// is blocked behind it meanwhile - awaiting it hangs the MCP call for as long as the
+// dialog sits there (2026-11-12: a user was left waiting minutes on the Configure Default
+// Formatter dialog). Race the dispatch against a timer; the command keeps running and
+// finishes once the dialog is answered, and the caller gets the dialog list back so
+// dismiss_dialog is one call away instead of a blind wait.
+const COMMAND_TIMEOUT_MS = 12000;
+async function dispatchCommand(id, args) {
+    const running = vscode.commands.executeCommand(id, ...(args || []))
+        .then((r) => ({ settled: true, result: r }))
+        .catch((e) => ({ settled: true, error: String((e && e.message) || e) }));
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(null), COMMAND_TIMEOUT_MS); });
+    const winner = await Promise.race([running, timedOut]);
+    clearTimeout(timer);
+    if (!winner) {
+        const d = enumDialogs();
+        return {
+            ok: false,
+            pending: true,
+            note: 'the command has not returned after ' + Math.round(COMMAND_TIMEOUT_MS / 1000) + ' s - a native dialog probably has the workbench blocked. It is still running: answer or dismiss the dialog and it continues. This call answers now instead of waiting.',
+            dialogs: d.dialogs || [],
+            dialogs_error: d.error,
+        };
+    }
+    if (winner.error) throw new Error(winner.error);
+    return winner.result;
+}
+
 // PostMessage queues; the modal loop needs a beat to process the click before the
 // verification re-enumeration runs (the PowerShell version got this delay for free
 // from its process spawn).
@@ -252,7 +281,8 @@ const TOOLS = [
         description: 'Runs a VS Code command by id with optional arguments, like choosing it from the command palette. Returns the command result (JSON, capped) or an error. Arguments that need VS Code objects are written as {"$uri": "c:\\\\a.txt"}, {"$pos": [line, character]} and {"$range": [l1, c1, l2, c2]}, e.g. vscode.executeHoverProvider with [{"$uri": "..."}, {"$pos": [0, 5]}].',
         inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array' } }, required: ['command'] },
         run: async (a) => {
-            const result = await vscode.commands.executeCommand(a.command, ...(a.args || []).map(reviveArg));
+            const result = await dispatchCommand(a.command, (a.args || []).map(reviveArg));
+            if (result && typeof result === 'object' && result.pending) return result;
             if (result === undefined) return { ok: true, result: null };
             // Provider commands (completions, hover, symbols) return large objects: cap what goes back.
             const text = JSON.stringify(result);
@@ -864,7 +894,8 @@ async function buildCommandTools() {
             inputSchema: { type: 'object', properties: { args: { type: 'array', description: 'Forwarded to the command unchanged, in run_command\'s {"args": [...]} shape.' } } },
             run: async (a) => {
                 const args = (a && Array.isArray(a.args) ? a.args : []).map(reviveArg);
-                const result = await vscode.commands.executeCommand(id, ...args);
+                const result = await dispatchCommand(id, args);
+                if (result && typeof result === 'object' && result.pending) return result;
                 if (result === undefined) return { ok: true, result: null };
                 const text = JSON.stringify(result);
                 if (text && text.length > MAX_TEXT) return { ok: true, truncated: true, result: cap(text) };
