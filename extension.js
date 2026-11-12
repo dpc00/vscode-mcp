@@ -8,7 +8,8 @@ const path = require('path');
 const fs = require('fs');
 const { execFile, exec } = require('child_process');
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.2';
+const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -119,10 +120,13 @@ function runCli(cliArgs) {
 const TOOLS = [
     {
         name: 'get_help',
-        description: 'Describes this server and its tools, and the gaps compared with sublime-mcp.',
+        description: 'Describes this server and its tools, and the gaps compared with sublime-mcp. Also reports pid, started_at and uptime_ms so a client can tell a restarted extension host from the one it was talking to before reload_window:',
         inputSchema: { type: 'object', properties: {} },
         run: async () => ({
             server: 'vscode-mcp ' + VERSION,
+            pid: process.pid,
+            started_at: STARTED_AT,
+            uptime_ms: Date.now() - STARTED_AT,
             vscode: vscode.version,
             what: 'Runs inside the VS Code extension host. Every VS Code command is reachable with run_command; list_commands finds them.',
             gaps: [
@@ -378,6 +382,54 @@ const TOOLS = [
         },
     },
     {
+        name: 'expect',
+        description: 'Asserts a file\'s text and returns pass/fail instead of the text: the content of the open document if that file is open (unsaved edits included), otherwise the file on disk. Give exactly one of equals (whole text), contains, not_contains, or matches (regular expression). Line endings are normalised unless ignore_line_endings is false. On failure it reports the first differing line with the expected and the actual line, so a whole phase of a test can run as one batch and only the mismatches need reading.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                path: { type: 'string' },
+                equals: { type: 'string' },
+                contains: { type: 'string' },
+                not_contains: { type: 'string' },
+                matches: { type: 'string' },
+                ignore_line_endings: { type: 'boolean', description: 'default true' },
+            },
+            required: ['path'],
+        },
+        run: async (a) => {
+            const modes = ['equals', 'contains', 'not_contains', 'matches'].filter((k) => a[k] !== undefined);
+            if (modes.length !== 1) throw new Error('give exactly one of equals, contains, not_contains, matches');
+            const mode = modes[0];
+            const uri = fileUri(a.path);
+            let actual, source;
+            const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
+            if (open) { actual = open.getText(); source = 'document'; }
+            else {
+                try { actual = fs.readFileSync(String(a.path), 'utf8'); source = 'disk'; }
+                catch (e) { return { ok: false, missing: true, path: String(a.path), mode }; }
+            }
+            const norm = (s) => (a.ignore_line_endings === false ? String(s) : String(s).replace(/\r\n/g, '\n'));
+            const A = norm(actual);
+            const needle = a[mode];
+            const E = mode === 'matches' ? String(needle) : norm(needle);
+            let ok;
+            if (mode === 'equals') ok = A === E;
+            else if (mode === 'contains') ok = A.includes(E);
+            else if (mode === 'not_contains') ok = !A.includes(E);
+            else ok = new RegExp(E, 'm').test(A);
+            const out = { ok, mode, path: String(a.path), source, chars: A.length };
+            if (ok) return out;
+            if (mode === 'matches') { out.pattern = E; return out; }
+            if (mode === 'contains' || mode === 'not_contains') { out.needle = cap(E, 300); out.head = cap(A, 400); return out; }
+            const al = A.split('\n'), el = E.split('\n');
+            let i = 0;
+            while (i < al.length && i < el.length && al[i] === el[i]) i++;
+            out.first_difference = { line: i, expected: cap(el[i] === undefined ? '' : el[i], 300), actual: cap(al[i] === undefined ? '' : al[i], 300) };
+            out.lines = { expected: el.length, actual: al.length };
+            return out;
+        },
+    },
+    {
         name: 'batch',
         description: 'Runs several tool calls in order in ONE request and returns one result per call: calls is a list of {tool, arguments} or {sleep: milliseconds}. Stops at the first error unless keep_going is true. Saves the round trip of every step of a test (create, open, edit, complete, diagnostics).',
         inputSchema: { type: 'object', properties: { calls: { type: 'array', items: { type: 'object' } }, keep_going: { type: 'boolean' } }, required: ['calls'] },
@@ -489,9 +541,16 @@ const TOOLS = [
     },
     {
         name: 'install_extension',
-        description: 'Installs an extension from the marketplace by id (publisher.name) with VS Code\'s own CLI. The command "workbench.extensions.installExtension" is not used: it opens a "Do you trust the publisher?" dialog that nothing can answer. The running window may list the new extension only after a reload (run_command workbench.action.reloadWindow).',
-        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids installed by ONE CLI process (much faster than one call each); results holds ok and version per id.' } } },
+        description: 'Installs an extension with VS Code\'s own CLI: from the marketplace by id (publisher.name), or from a .vsix file already downloaded (give vsix: path) - that skips the marketplace round trip, which is the slowest part of a test round. The command "workbench.extensions.installExtension" is not used: it opens a "Do you trust the publisher?" dialog that nothing can answer. The running window may list the new extension only after a reload (run_command workbench.action.reloadWindow).',
+        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids installed by ONE CLI process (much faster than one call each); results holds ok and version per id.' }, vsix: { type: 'string', description: 'Absolute path to a .vsix on disk (e.g. the file a triage download already produced). Takes precedence over id/ids.' } } },
         run: async (a) => {
+            if (a.vsix) {
+                const p = String(a.vsix);
+                const out = await runCli(['--install-extension', p, '--force']);
+                // For a .vsix the CLI names the FILE, not the extension id: "Extension 'ext.vsix' was successfully installed".
+                const m = /Extension '([^']+)' was successfully installed/i.exec(out);
+                return { ok: !!m, vsix: p, cli_says: m ? m[1] : '', note: 'the CLI reports the file name for a .vsix; confirm the id with list_extensions after a reload', cli: out.trim() };
+            }
             const ids = a.ids && a.ids.length ? a.ids.map(String) : (a.id ? [String(a.id)] : []);
             if (!ids.length) throw new Error('give id or ids');
             const args = [];
