@@ -2,8 +2,6 @@
 
 An MCP server inside VS Code, like [sublime-mcp](https://github.com/dpc00/sublime-mcp) is for Sublime Text. It is a VS Code extension in plain JavaScript (no dependencies, no build step) that serves MCP (JSON-RPC over HTTP) on `http://127.0.0.1:9560/mcp`.
 
-[![Support on Patreon](https://img.shields.io/badge/Support-Patreon-orange)](https://www.patreon.com/dpchitester)
-
 ## Run it
 
 Development mode, nothing installed into VS Code:
