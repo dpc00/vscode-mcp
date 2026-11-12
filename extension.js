@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -333,7 +333,7 @@ const TOOLS = [
         description: 'Saves an open file by path.',
         inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
         run: async (a) => {
-            const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath.toLowerCase() === String(a.path).toLowerCase());
+            const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath.toLowerCase() === vscode.Uri.file(String(a.path)).fsPath.toLowerCase());
             if (!doc) throw new Error('file is not open');
             return { ok: await doc.save() };
         },
