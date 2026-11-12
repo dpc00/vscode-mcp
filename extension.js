@@ -7,8 +7,9 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
+const os = require('os');
 
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -133,10 +134,39 @@ public class VSDlg {
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr after, string cls, string title);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
 }`;
-const PS_PRELUDE = `$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n` + VSDLG_CS + `\n'@\n`;
+const PS_PRELUDE = (() => {
+    // Compiling the P/Invoke source costs ~1 s of every dialog call. Build the assembly
+    // to a per-instance DLL once, then load it from disk (~50 ms) after that. Every
+    // step falls back to plain Add-Type so a read-only temp or a lock race cannot
+    // break the tools.
+    const dll = path.join(os.tmpdir(), 'vscode-mcp-dialogs-' + process.pid + '.dll');
+    if (fs.existsSync(dll)) {
+        return `$ErrorActionPreference = 'Stop'\ntry { Add-Type -Path '${dll}' } catch { Add-Type -TypeDefinition @'\n` + VSDLG_CS + `\n'@ }\n`;
+    }
+    return `$ErrorActionPreference = 'Stop'\n$vsdlgSrc = @'\n` + VSDLG_CS + `\n'@\ntry {\n  Add-Type -TypeDefinition $vsdlgSrc -OutputAssembly '${dll}.new'\n  Move-Item -Force '${dll}.new' '${dll}'\n} catch {}\ntry { Add-Type -Path '${dll}' } catch { Add-Type -TypeDefinition $vsdlgSrc }\n`;
+})();
 const PS_ENUM_DIALOGS = PS_PRELUDE + `
 $targets = $env:VSCODE_PIDS.Split(',') | ForEach-Object { [uint32]$_ }
 $found = @()
+# Buttons at ANY depth: classic dialogs keep Buttons as direct children, but Task
+# Dialogs and IFileDialogs virtualize their controls inside child containers, so
+# only walking direct children misses them. Depth-capped so a weird tree cannot
+# spin forever.
+function Get-DlgButtons($parent, $depth, $list) {
+  if ($depth -gt 4) { return }
+  $c = [VSDlg]::GetWindow($parent, 5)
+  while ($c -ne [IntPtr]::Zero) {
+    $cls = New-Object System.Text.StringBuilder 256
+    [void][VSDlg]::GetClassName($c, $cls, 256)
+    if ($cls.ToString() -eq 'Button') {
+      $bt = New-Object System.Text.StringBuilder 256
+      [void][VSDlg]::GetWindowText($c, $bt, 256)
+      if ($bt.Length -gt 0) { [void]$list.Add(@{ hwnd = $c.ToInt64(); text = $bt.ToString() }) }
+    }
+    Get-DlgButtons $c ($depth + 1) $list
+    $c = [VSDlg]::GetWindow($c, 2)
+  }
+}
 $h = [VSDlg]::GetTopWindow([IntPtr]::Zero)
 while ($h -ne [IntPtr]::Zero) {
   $wpid = [uint32]0
@@ -147,20 +177,14 @@ while ($h -ne [IntPtr]::Zero) {
     if ($cn.ToString() -eq '#32770') {
       $tt = New-Object System.Text.StringBuilder 512
       [void][VSDlg]::GetWindowText($h, $tt, 512)
-      $buttons = @()
-      $b = [VSDlg]::FindWindowEx($h, [IntPtr]::Zero, 'Button', $null)
-      while ($b -ne [IntPtr]::Zero) {
-        $bt = New-Object System.Text.StringBuilder 256
-        [void][VSDlg]::GetWindowText($b, $bt, 256)
-        if ($bt.Length -gt 0) { $buttons += @{ hwnd = $b.ToInt64(); text = $bt.ToString() } }
-        $b = [VSDlg]::FindWindowEx($h, $b, 'Button', $null)
-      }
+      $buttons = New-Object System.Collections.ArrayList
+      Get-DlgButtons $h 0 $buttons
       $found += @{ hwnd = $h.ToInt64(); pid = $wpid; title = $tt.ToString(); buttons = $buttons }
     }
   }
   $h = [VSDlg]::GetWindow($h, 2)
 }
-if ($found.Count -eq 0) { '[]' } else { $found | ConvertTo-Json -Depth 3 -Compress }
+if ($found.Count -eq 0) { '[]' } else { $found | ConvertTo-Json -Depth 4 -Compress }
 `;
 
 function dialogPids() {
@@ -188,8 +212,8 @@ function parseDialogs(stdout) {
     } catch (e) { return []; }
 }
 
-function psDismiss(targetHwnd, msg) {
-    return PS_PRELUDE + `\n[void][VSDlg]::PostMessage([IntPtr]::new(` + Number(targetHwnd) + `), ` + Number(msg) + `, [IntPtr]::Zero, [IntPtr]::Zero)\n'done'\n`;
+function psDismiss(targetHwnd, msg, wParam) {
+    return PS_PRELUDE + `\n[void][VSDlg]::PostMessage([IntPtr]::new(` + Number(targetHwnd) + `), ` + Number(msg) + `, [IntPtr]::new(` + Number(wParam || 0) + `), [IntPtr]::Zero)\n'done'\n`;
 }
 
 const CANCEL_RE = /cancel|no\b|don.?t save|close|discard/i;
@@ -594,7 +618,7 @@ const TOOLS = [
     },
     {
         name: 'list_dialogs',
-        description: 'Lists the native OS dialogs (class #32770) of this VS Code instance: hwnd, title and the labelled buttons of each. This is the tool for "a dialog is up and nothing answers": file open/save dialogs, confirmations and message boxes of the editor itself. Empty list means no native dialog is up (workbench quick picks and input boxes are NOT visible to any API - they are recorded as a gap). Costs one PowerShell round trip, about 1-2 s.',
+        description: 'Lists the native OS dialogs (class #32770) of this VS Code instance: hwnd, title and the labelled buttons of each (buttons are walked at every child depth, but Task Dialogs and file pickers virtualize their controls, so buttons may be empty even when the dialog has them). This is the tool for "a dialog is up and nothing answers": file open/save dialogs, confirmations and message boxes of the editor itself. Empty list means no native dialog is up (workbench quick picks and input boxes are NOT visible to any API - they are recorded as a gap). Costs one PowerShell round trip; about 0.3 s after the first call, ~1 s cold.',
         inputSchema: { type: 'object', properties: {} },
         run: async () => {
             const r = await runPowerShell(PS_ENUM_DIALOGS);
@@ -604,7 +628,7 @@ const TOOLS = [
     },
     {
         name: 'dismiss_dialog',
-        description: 'Closes a native dialog of this VS Code instance: clicks the button matching cancel_re (default /cancel|no|don.t save|close|discard/i - cancel is the safe answer), or sends WM_CLOSE when no labelled button matches. hwnd defaults to the first dialog from list_dialogs. Workbench quick picks and input boxes are not native dialogs - they are unreachable.',
+        description: 'Closes a native dialog of this VS Code instance, cancel-first: clicks the button matching cancel_re (default /cancel|no|don.t save|close|discard/i) when one is visible, otherwise posts WM_COMMAND IDCANCEL (the dialog\'s own cancel press), then WM_CLOSE (on Task Dialogs WM_CLOSE IS cancel). Verifies the close by re-enumerating and reports dismissed/still_up, so no second list_dialogs call is needed. hwnd defaults to the first dialog from list_dialogs. Workbench quick picks and input boxes are not native dialogs - they are unreachable.',
         inputSchema: { type: 'object', properties: { hwnd: { type: 'number' }, cancel_re: { type: 'string' } } },
         run: async (a) => {
             const enumOut = await runPowerShell(PS_ENUM_DIALOGS);
@@ -620,13 +644,30 @@ const TOOLS = [
             if (a.cancel_re) {
                 try { re = new RegExp(a.cancel_re, 'i'); } catch (e) { return { ok: false, error: 'bad cancel_re: ' + e.message }; }
             }
+            // Cancel-first ladder, safest press available:
+            //   1. a labelled button matching cancel_re (BM_CLICK),
+            //   2. WM_COMMAND IDCANCEL (the dialog's own cancel press - works on
+            //      classic dialogs whose buttons are virtualized and invisible),
+            //   3. WM_CLOSE (on Task Dialogs this IS cancel).
+            // Then re-enumerate once and report whether it really went away, so the
+            // caller does not need a second list_dialogs round trip.
             const cancel = (dlg.buttons || []).find((b) => re.test(b.text || ''));
+            const WM_COMMAND_IDCANCEL = 0x0111, IDCANCEL = 2, WM_CLOSE = 0x0010, BM_CLICK = 0x00F5;
+            let via;
             if (cancel) {
-                const r = await runPowerShell(psDismiss(cancel.hwnd, 0x00F5));
-                return { ok: !r.error, via: 'button: ' + cancel.text, button_hwnd: cancel.hwnd, error: r.error };
+                const r = await runPowerShell(psDismiss(cancel.hwnd, BM_CLICK));
+                via = 'button: ' + cancel.text;
+                if (r.error) return { ok: false, via, button_hwnd: cancel.hwnd, error: r.error };
+            } else {
+                const r1 = await runPowerShell(psDismiss(dlg.hwnd, WM_COMMAND_IDCANCEL, IDCANCEL));
+                if (r1.error) return { ok: false, via: 'WM_COMMAND(IDCANCEL)', hwnd: dlg.hwnd, error: r1.error };
+                via = 'WM_COMMAND(IDCANCEL)';
+                const r2 = await runPowerShell(psDismiss(dlg.hwnd, WM_CLOSE));
+                if (r2.error) return { ok: false, via, hwnd: dlg.hwnd, error: r2.error };
             }
-            const r = await runPowerShell(psDismiss(dlg.hwnd, 0x0010));
-            return { ok: !r.error, via: 'WM_CLOSE', hwnd: dlg.hwnd, error: r.error };
+            const after = parseDialogs((await runPowerShell(PS_ENUM_DIALOGS)).stdout || '[]');
+            const still = after.some((d) => d.hwnd === dlg.hwnd);
+            return { ok: !still, via, hwnd: dlg.hwnd, dismissed: !still, still_up: still, note: still ? 'dialog is still up - it may belong to a command that keeps raising it' : undefined };
         },
     },
     {
