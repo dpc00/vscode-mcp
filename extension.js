@@ -7,9 +7,8 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
-const os = require('os');
 
-const VERSION = '0.7.2';
+const VERSION = '0.8.0';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -120,101 +119,86 @@ function runCli(cliArgs) {
 
 // Native dialogs of THIS VS Code instance (main process + this extension host), found by
 // enumerating the OS windows whose class is #32770 - the class every standard Windows
-// dialog uses, and no VS Code editor window uses. Implemented in PowerShell (inline, no
-// native dependency): the same trick sublime-commander's dialog watcher uses, ported.
-const VSDLG_CS = `
-using System;using System.Runtime.InteropServices;using System.Text;
-public class VSDlg {
-  [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);
-  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr after, string cls, string title);
-  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
-}`;
-const PS_PRELUDE = (() => {
-    // Compiling the P/Invoke source costs ~1 s of every dialog call. Build the assembly
-    // to a per-instance DLL once, then load it from disk (~50 ms) after that. Every
-    // step falls back to plain Add-Type so a read-only temp or a lock race cannot
-    // break the tools.
-    const dll = path.join(os.tmpdir(), 'vscode-mcp-dialogs-' + process.pid + '.dll');
-    if (fs.existsSync(dll)) {
-        return `$ErrorActionPreference = 'Stop'\ntry { Add-Type -Path '${dll}' } catch { Add-Type -TypeDefinition @'\n` + VSDLG_CS + `\n'@ }\n`;
+// dialog uses, and no VS Code editor window uses. Implemented with koffi, a prebuilt FFI
+// that ships inside the extension: plain user32 calls, the same ones sublime-commander's
+// dialog watcher uses. No PowerShell, no compiler, nothing for the user's machine to build.
+let KOFFI_ERROR = null;
+let koffi = null;
+let user32 = null;
+try {
+    koffi = require('koffi');
+    koffi.alias('HWND', 'uintptr_t'); // handles are pointer-sized; koffi hands them back as BigInt
+    user32 = koffi.load('user32.dll');
+} catch (e) { KOFFI_ERROR = String((e && e.message) || e).slice(0, 200); }
+
+const u32 = (h) => (h === null || h === undefined) ? 0 : Number(h);
+const GetTopWindow = user32 && user32.func('HWND __stdcall GetTopWindow(HWND hWnd)');
+const GetWindow = user32 && user32.func('HWND __stdcall GetWindow(HWND hWnd, uint32_t uCmd)');
+const IsWindowVisible = user32 && user32.func('bool __stdcall IsWindowVisible(HWND hWnd)');
+const GetWindowThreadProcessId = user32 && user32.func('uint32_t __stdcall GetWindowThreadProcessId(HWND hWnd, _Out_ uint32_t *pid)');
+const GetClassNameW = user32 && user32.func('int __stdcall GetClassNameW(HWND hWnd, _Out_ uint16_t *name, int max)');
+const GetWindowTextW = user32 && user32.func('int __stdcall GetWindowTextW(HWND hWnd, _Out_ uint16_t *text, int max)');
+const PostMessageW = user32 && user32.func('bool __stdcall PostMessageW(HWND hWnd, uint32_t msg, uintptr_t wParam, intptr_t lParam)');
+
+function windowText(h, max) {
+    const buf = Buffer.allocUnsafe(max * 2);
+    const n = GetWindowTextW(h, buf, max);
+    return n > 0 ? koffi.decode(buf, 'char16_t', n) : '';
+}
+
+function windowClass(h) {
+    const buf = Buffer.allocUnsafe(256 * 2);
+    const n = GetClassNameW(h, buf, 256);
+    return n > 0 ? koffi.decode(buf, 'char16_t', n) : '';
+}
+
+// Buttons at ANY depth: classic dialogs keep Buttons as direct children, but Task
+// Dialogs and IFileDialogs virtualize their controls inside child containers, so
+// only walking direct children misses them. Depth-capped so a weird tree cannot
+// spin forever.
+function walkButtons(h, depth, list) {
+    if (depth > 4) return;
+    let c = u32(GetWindow(h, 5)); // GW_CHILD
+    while (c) {
+        if (windowClass(c) === 'Button') {
+            const text = windowText(c, 256);
+            if (text) list.push({ hwnd: c, text });
+        }
+        walkButtons(c, depth + 1, list);
+        c = u32(GetWindow(c, 2)); // GW_HWNDNEXT
     }
-    return `$ErrorActionPreference = 'Stop'\n$vsdlgSrc = @'\n` + VSDLG_CS + `\n'@\ntry {\n  Add-Type -TypeDefinition $vsdlgSrc -OutputAssembly '${dll}.new'\n  Move-Item -Force '${dll}.new' '${dll}'\n} catch {}\ntry { Add-Type -Path '${dll}' } catch { Add-Type -TypeDefinition $vsdlgSrc }\n`;
-})();
-const PS_ENUM_DIALOGS = PS_PRELUDE + `
-$targets = $env:VSCODE_PIDS.Split(',') | ForEach-Object { [uint32]$_ }
-$found = @()
-# Buttons at ANY depth: classic dialogs keep Buttons as direct children, but Task
-# Dialogs and IFileDialogs virtualize their controls inside child containers, so
-# only walking direct children misses them. Depth-capped so a weird tree cannot
-# spin forever.
-function Get-DlgButtons($parent, $depth, $list) {
-  if ($depth -gt 4) { return }
-  $c = [VSDlg]::GetWindow($parent, 5)
-  while ($c -ne [IntPtr]::Zero) {
-    $cls = New-Object System.Text.StringBuilder 256
-    [void][VSDlg]::GetClassName($c, $cls, 256)
-    if ($cls.ToString() -eq 'Button') {
-      $bt = New-Object System.Text.StringBuilder 256
-      [void][VSDlg]::GetWindowText($c, $bt, 256)
-      if ($bt.Length -gt 0) { [void]$list.Add(@{ hwnd = $c.ToInt64(); text = $bt.ToString() }) }
+}
+
+// The main process (parent of this extension host) owns the native dialogs; this
+// extension host owns none, but is included so nothing is missed.
+const DIALOG_PIDS = new Set([process.ppid, process.pid].filter((p) => Number.isFinite(p)));
+
+function enumDialogs() {
+    if (!user32) return { dialogs: [], error: KOFFI_ERROR || 'user32.dll not loaded' };
+    const dialogs = [];
+    let h = u32(GetTopWindow(0));
+    while (h) {
+        const pid = [0];
+        if (GetWindowThreadProcessId(h, pid) && DIALOG_PIDS.has(pid[0]) && IsWindowVisible(h)) {
+            if (windowClass(h) === '#32770') {
+                const buttons = [];
+                walkButtons(h, 0, buttons);
+                dialogs.push({ hwnd: h, pid: pid[0], title: windowText(h, 512), buttons });
+            }
+        }
+        h = u32(GetWindow(h, 2));
     }
-    Get-DlgButtons $c ($depth + 1) $list
-    $c = [VSDlg]::GetWindow($c, 2)
-  }
-}
-$h = [VSDlg]::GetTopWindow([IntPtr]::Zero)
-while ($h -ne [IntPtr]::Zero) {
-  $wpid = [uint32]0
-  [void][VSDlg]::GetWindowThreadProcessId($h, [ref]$wpid)
-  if ($targets -contains $wpid -and [VSDlg]::IsWindowVisible($h)) {
-    $cn = New-Object System.Text.StringBuilder 256
-    [void][VSDlg]::GetClassName($h, $cn, 256)
-    if ($cn.ToString() -eq '#32770') {
-      $tt = New-Object System.Text.StringBuilder 512
-      [void][VSDlg]::GetWindowText($h, $tt, 512)
-      $buttons = New-Object System.Collections.ArrayList
-      Get-DlgButtons $h 0 $buttons
-      $found += @{ hwnd = $h.ToInt64(); pid = $wpid; title = $tt.ToString(); buttons = $buttons }
-    }
-  }
-  $h = [VSDlg]::GetWindow($h, 2)
-}
-if ($found.Count -eq 0) { '[]' } else { $found | ConvertTo-Json -Depth 4 -Compress }
-`;
-
-function dialogPids() {
-    // The main process (parent of this extension host) owns the native dialogs; this
-    // extension host owns none, but is included so nothing is missed.
-    const pids = [process.ppid, process.pid].filter((p) => Number.isFinite(p));
-    return pids.join(',');
+    return { dialogs };
 }
 
-function runPowerShell(script, timeoutMs) {
-    return new Promise((resolve) => {
-        execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
-            { env: Object.assign({}, process.env, { VSCODE_PIDS: dialogPids() }), timeout: timeoutMs || 20000, windowsHide: true },
-            (err, stdout) => {
-                if (err && !String(stdout || '').trim()) { resolve({ error: String((err && err.message) || err).slice(0, 300) }); return; }
-                resolve({ stdout: String(stdout || '').trim() });
-            });
-    });
+function postMessage(h, msg, wParam) {
+    PostMessageW(h, msg, u32(wParam), 0);
 }
 
-function parseDialogs(stdout) {
-    try {
-        const value = JSON.parse(stdout);
-        return Array.isArray(value) ? value : [value];
-    } catch (e) { return []; }
-}
-
-function psDismiss(targetHwnd, msg, wParam) {
-    return PS_PRELUDE + `\n[void][VSDlg]::PostMessage([IntPtr]::new(` + Number(targetHwnd) + `), ` + Number(msg) + `, [IntPtr]::new(` + Number(wParam || 0) + `), [IntPtr]::Zero)\n'done'\n`;
-}
+// PostMessage queues; the modal loop needs a beat to process the click before the
+// verification re-enumeration runs (the PowerShell version got this delay for free
+// from its process spawn).
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CANCEL_RE = /cancel|no\b|don.?t save|close|discard/i;
 
@@ -618,12 +602,11 @@ const TOOLS = [
     },
     {
         name: 'list_dialogs',
-        description: 'Lists the native OS dialogs (class #32770) of this VS Code instance: hwnd, title and the labelled buttons of each (buttons are walked at every child depth, but Task Dialogs and file pickers virtualize their controls, so buttons may be empty even when the dialog has them). This is the tool for "a dialog is up and nothing answers": file open/save dialogs, confirmations and message boxes of the editor itself. Empty list means no native dialog is up (workbench quick picks and input boxes are NOT visible to any API - they are recorded as a gap). Costs one PowerShell round trip; about 0.3 s after the first call, ~1 s cold.',
+        description: 'Lists the native OS dialogs (class #32770) of this VS Code instance: hwnd, title and the labelled buttons of each (buttons are walked at every child depth, but Task Dialogs and file pickers virtualize their controls, so buttons may be empty even when the dialog has them). This is the tool for "a dialog is up and nothing answers": file open/save dialogs, confirmations and message boxes of the editor itself. Empty list means no native dialog is up (workbench quick picks and input boxes are NOT visible to any API - they are recorded as a gap). Instant: a direct user32 walk through the extension\'s bundled FFI (koffi), no PowerShell and no compiler involved.',
         inputSchema: { type: 'object', properties: {} },
         run: async () => {
-            const r = await runPowerShell(PS_ENUM_DIALOGS);
-            if (r.error) return { dialogs: [], error: r.error };
-            return { dialogs: parseDialogs(r.stdout) };
+            const r = enumDialogs();
+            return r;
         },
     },
     {
@@ -631,8 +614,9 @@ const TOOLS = [
         description: 'Closes a native dialog of this VS Code instance, cancel-first: clicks the button matching cancel_re (default /cancel|no|don.t save|close|discard/i) when one is visible, otherwise posts WM_COMMAND IDCANCEL (the dialog\'s own cancel press), then WM_CLOSE (on Task Dialogs WM_CLOSE IS cancel). Verifies the close by re-enumerating and reports dismissed/still_up, so no second list_dialogs call is needed. hwnd defaults to the first dialog from list_dialogs. Workbench quick picks and input boxes are not native dialogs - they are unreachable.',
         inputSchema: { type: 'object', properties: { hwnd: { type: 'number' }, cancel_re: { type: 'string' } } },
         run: async (a) => {
-            const enumOut = await runPowerShell(PS_ENUM_DIALOGS);
-            const dialogs = parseDialogs(enumOut.stdout || '[]');
+            const enumOut = enumDialogs();
+            if (enumOut.error) return { ok: false, error: enumOut.error };
+            const dialogs = enumOut.dialogs;
             if (!dialogs.length) return { ok: false, note: 'no native dialog is up' };
             let dlg = dialogs[0];
             if (a.hwnd !== undefined) {
@@ -655,17 +639,15 @@ const TOOLS = [
             const WM_COMMAND_IDCANCEL = 0x0111, IDCANCEL = 2, WM_CLOSE = 0x0010, BM_CLICK = 0x00F5;
             let via;
             if (cancel) {
-                const r = await runPowerShell(psDismiss(cancel.hwnd, BM_CLICK));
+                postMessage(cancel.hwnd, BM_CLICK);
                 via = 'button: ' + cancel.text;
-                if (r.error) return { ok: false, via, button_hwnd: cancel.hwnd, error: r.error };
             } else {
-                const r1 = await runPowerShell(psDismiss(dlg.hwnd, WM_COMMAND_IDCANCEL, IDCANCEL));
-                if (r1.error) return { ok: false, via: 'WM_COMMAND(IDCANCEL)', hwnd: dlg.hwnd, error: r1.error };
+                postMessage(dlg.hwnd, WM_COMMAND_IDCANCEL, IDCANCEL);
                 via = 'WM_COMMAND(IDCANCEL)';
-                const r2 = await runPowerShell(psDismiss(dlg.hwnd, WM_CLOSE));
-                if (r2.error) return { ok: false, via, hwnd: dlg.hwnd, error: r2.error };
+                postMessage(dlg.hwnd, WM_CLOSE);
             }
-            const after = parseDialogs((await runPowerShell(PS_ENUM_DIALOGS)).stdout || '[]');
+            await sleep(200);
+            const after = enumDialogs().dialogs;
             const still = after.some((d) => d.hwnd === dlg.hwnd);
             return { ok: !still, via, hwnd: dlg.hwnd, dismissed: !still, still_up: still, note: still ? 'dialog is still up - it may belong to a command that keeps raising it' : undefined };
         },

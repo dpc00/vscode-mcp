@@ -2,16 +2,28 @@
   "name": "vscode-mcp",
   "displayName": "VS Code MCP",
   "description": "Exposes VS Code's own commands, tabs, text and extensions to an agent over MCP, like sublime-mcp does for Sublime Text.",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "publisher": "dpc00",
   "license": "MIT",
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Other"],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "dependencies": {
+    "koffi": "3.3.7"
+  },
+  "categories": [
+    "Other"
+  ],
   "main": "./extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "vscodeMcp.restart", "title": "VS Code MCP: Restart server" }
+      {
+        "command": "vscodeMcp.restart",
+        "title": "VS Code MCP: Restart server"
+      }
     ],
     "configuration": {
       "title": "VS Code MCP",
@@ -38,5 +50,8 @@
         }
       }
     }
+  },
+  "dependencies": {
+    "koffi": "3.3.7"
   }
 }

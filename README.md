@@ -1,6 +1,6 @@
 # vscode-mcp
 
-An MCP server inside VS Code, like [sublime-mcp](https://github.com/dpc00/sublime-mcp) is for Sublime Text. It is a VS Code extension in plain JavaScript (no dependencies, no build step) that serves MCP (JSON-RPC over HTTP) on `http://127.0.0.1:9560/mcp`.
+An MCP server inside VS Code, like [sublime-mcp](https://github.com/dpc00/sublime-mcp) is for Sublime Text. It is a VS Code extension in plain JavaScript (no build step; one dependency, the prebuilt [koffi](https://www.npmjs.com/package/koffi) FFI, which ships inside the extension - the user's machine provides nothing and compiles nothing) that serves MCP (JSON-RPC over HTTP) on `http://127.0.0.1:9560/mcp`.
 
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue)](https://www.paypal.me/DChitester)
 
@@ -11,6 +11,7 @@ Contact: donaldchitester@gmail.com
 
 Development mode, nothing installed into VS Code:
 
+    npm install
     Code.exe --extensionDevelopmentPath=<this folder>
 
 Connect Claude Code:
@@ -25,7 +26,7 @@ Port: setting `vscodeMcp.port`. The server accepts only loopback hosts and refus
 
 **Generated command tools (0.7.0, the sublime-commander pattern).** At activation the server takes this window's full VS Code command list and wraps EVERY command as a tool named after it (`workbench.action.files.newUntitledFile` becomes `workbench_action_files_newUntitledFile`; very long ids get a hash suffix). Each wrapper dispatches the command as-is with `{"args": [...]}` exactly like `run_command`, and carries the original id in its description, so extension commands appear as first-class tools the moment they are installed. This VS Code 1.144 window yields 2824 generated tools on top of the 29 hand-written ones; `discover` is how they stay usable. 0.7.0 also removes `run_shell`: the MCP surface is the editor's domain, and shelling out belongs to the test driver's own shell, not to a VS Code bridge.
 
-**Native dialogs (0.7.1, hardened in 0.7.2).** `list_dialogs` enumerates this instance's native OS dialogs (class `#32770`): hwnd, title and the labelled buttons of each. 0.7.2 walks the buttons at every child depth, because Task Dialogs and file pickers virtualize their controls inside child containers and the old direct-children-only walk missed them. `dismiss_dialog` closes one cancel-first: a button matching `cancel_re` (default cancel/no/don't save/close/discard) when one is visible, otherwise `WM_COMMAND IDCANCEL` (the dialog's own cancel press, which works when the buttons are virtualized), then `WM_CLOSE` - and 0.7.2 verifies the close by re-enumerating, so the result reports `dismissed` or `still_up` and no second `list_dialogs` round trip is needed. One PowerShell round trip: about 1 s cold, ~0.3 s after that, because the P/Invoke source compiles once to a per-instance DLL in temp and is then loaded from disk (with a plain Add-Type fallback if the temp folder refuses).
+**Native dialogs (0.7.1; 0.8.0 dropped PowerShell for a bundled FFI).** `list_dialogs` enumerates this instance's native OS dialogs (class `#32770`): hwnd, title and the labelled buttons of each, walked at every child depth because Task Dialogs and file pickers virtualize their controls inside child containers. `dismiss_dialog` closes one cancel-first: a button matching `cancel_re` (default cancel/no/don't save/close/discard) when one is visible, otherwise `WM_COMMAND IDCANCEL` (the dialog's own cancel press, which works when the buttons are virtualized), then `WM_CLOSE` - and it verifies the close by re-enumerating, so the result reports `dismissed` or `still_up` and no second `list_dialogs` round trip is needed. Since 0.8.0 both tools are instant: the extension declares its six user32 functions on koffi (a prebuilt N-API FFI, about 1 MB of x64 binary inside the `.vsix`) and walks the windows directly - no PowerShell process per call, and no C# compile on the user's machine (the 0.7.2 approach compiled a P/Invoke assembly with Add-Type and cached it in temp; that requirement on the user's .NET toolchain is gone).
 
 Why `expect` exists: a test phase used to end with `get_text` and the agent reading the whole file to see whether it matched. With the assertion inside the batch, a phase returns "ok" or the one line that differs, so several phases can run per round trip and nothing is read that did not fail. Measured on the Live Server round (2026-11-11): 11-step serving batch 0.98 s, 7-step HTTP edge-case batch 0.36 s, settings write + stop/start + 3 assertions 1.9 s.
 
