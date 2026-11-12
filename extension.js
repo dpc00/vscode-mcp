@@ -6,9 +6,9 @@ const vscode = require('vscode');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const { execFile, exec } = require('child_process');
+const { execFile } = require('child_process');
 
-const VERSION = '0.6.2';
+const VERSION = '0.7.0';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -134,7 +134,9 @@ const TOOLS = [
                 'No screenshots from inside the extension host; use an external screenshot tool.',
                 'Output channels of other extensions cannot be read through the API.',
             ],
-            tools: TOOLS.map(t => t.name),
+            tools_hand_written: TOOLS.filter(t => !t.generated).map(t => t.name),
+            tools_count: TOOLS.length,
+            generated: 'Every tool above the hand-written list is a GENERATED VS Code command tool, one per command id, dispatched as-is. Find them with discover {query}; run them with {"args": [...]} exactly like run_command.',
         }),
     },
     {
@@ -317,30 +319,23 @@ const TOOLS = [
         },
     },
     {
-        name: 'run_shell',
-        description: 'Runs a shell command on this machine from inside the extension host and returns exit code, stdout and stderr (each capped). cwd defaults to the first workspace folder. Use it to read files a program wrote, run the program under test, or copy a probe around without a separate terminal round trip. timeout_ms default 30000.',
-        inputSchema: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string' }, timeout_ms: { type: 'number' } }, required: ['command'] },
-        run: (a) => new Promise((resolve) => {
-            const folders = vscode.workspace.workspaceFolders;
-            const cwd = a.cwd || (folders && folders.length ? folders[0].uri.fsPath : undefined);
-            const started = Date.now();
-            exec(String(a.command), {
-                cwd,
-                timeout: Math.min(a.timeout_ms || 30000, 300000),
-                maxBuffer: 8 * 1024 * 1024,
-                windowsHide: true,
-            }, (err, stdout, stderr) => {
-                const out = {
-                    code: err && typeof err.code === 'number' ? err.code : (err ? null : 0),
-                    stdout: cap(String(stdout || '')),
-                    stderr: cap(String(stderr || '')),
-                    ms: Date.now() - started,
-                };
-                if (err && err.killed) out.timed_out = true;
-                if (err && typeof err.code !== 'number' && !err.killed) out.error = String(err.message || err).slice(0, 500);
-                resolve(out);
-            });
-        }),
+        name: 'discover',
+        description: 'Finds tools by case-insensitive regular expression on name or description, over every tool INCLUDING the generated VS Code command tools (one per command id). Returns total and up to limit (default 30) matches as {name, generated, command, description}. This is how a 1000-tool surface stays usable: never scroll a list, search it.',
+        inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] },
+        run: async (a) => {
+            const re = new RegExp(String(a.query), 'i');
+            const limit = Math.min(a.limit || 30, 200);
+            const matches = TOOLS.filter(t => re.test(t.name) || re.test(t.description || ''));
+            return {
+                total: matches.length,
+                tools: matches.slice(0, limit).map(t => ({
+                    name: t.name,
+                    generated: !!t.generated,
+                    command: t.commandId,
+                    description: (t.description || '').slice(0, 160),
+                })),
+            };
+        },
     },
     {
         name: 'wait_for',
@@ -681,12 +676,60 @@ function startServer(output) {
     return srv;
 }
 
+// The generated VS Code command tools: one wrapper per command id in this window's
+// command list, named after the command (dots become underscores; very long ids get a
+// hash suffix; collisions get a counter). Arguments are forwarded as in run_command.
+// This is the sublime-commander pattern: the editor's own command surface, as tools.
+function hash6(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h * 33) + s.charCodeAt(i)) >>> 0;
+    return h.toString(36).slice(0, 6);
+}
+
+function commandToolName(id, used) {
+    let base = String(id).replace(/[^A-Za-z0-9-]/g, '_');
+    if (base.length > 58) base = base.slice(0, 50) + '_' + hash6(String(id));
+    let name = base;
+    for (let n = 2; used.has(name); n++) name = base + '_' + n;
+    used.add(name);
+    return name;
+}
+
+async function buildCommandTools() {
+    const used = new Set(TOOLS.map(t => t.name));
+    const ids = await vscode.commands.getCommands(true);
+    const out = [];
+    for (const id of ids) {
+        const name = commandToolName(id, used);
+        out.push({
+            name,
+            generated: true,
+            commandId: id,
+            description: 'VS Code command `' + id + '` (generated from this window\'s command list; dispatched as-is, like run_command). Pass {"args": [...]}; {"$uri"}, {"$pos"} and {"$range"} items revive to real VS Code objects.',
+            inputSchema: { type: 'object', properties: { args: { type: 'array', description: 'Forwarded to the command unchanged, in run_command\'s {"args": [...]} shape.' } } },
+            run: async (a) => {
+                const args = (a && Array.isArray(a.args) ? a.args : []).map(reviveArg);
+                const result = await vscode.commands.executeCommand(id, ...args);
+                if (result === undefined) return { ok: true, result: null };
+                const text = JSON.stringify(result);
+                if (text && text.length > MAX_TEXT) return { ok: true, truncated: true, result: cap(text) };
+                return { ok: true, result };
+            },
+        });
+    }
+    return out;
+}
+
 function activate(context) {
     logDir = path.dirname(context.logUri.fsPath);
     const output = vscode.window.createOutputChannel('VS Code MCP');
     statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 0);
     statusItem.show();
     server = startServer(output);
+    buildCommandTools().then((gen) => {
+        TOOLS.push(...gen);
+        output.appendLine('generated ' + gen.length + ' command tools; ' + TOOLS.length + ' tools in all');
+    }, (e) => output.appendLine('command tool generation failed: ' + String((e && e.message) || e)));
     context.subscriptions.push(
         output,
         statusItem,
