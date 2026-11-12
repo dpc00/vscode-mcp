@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -65,14 +65,19 @@ function listTabs() {
     return out;
 }
 
+// The caller may spell a path with forward slashes, a lower-case drive or a
+// different case; compare it with uri.fsPath in the one form VS Code uses.
+function wantFsPath(p) {
+    try { return vscode.Uri.file(String(p)).fsPath.toLowerCase(); } catch (e) { return String(p).toLowerCase(); }
+}
+
 function findTab(args) {
-    const matches = [];
-    vscode.window.tabGroups.all.forEach((group, g) => {
+    const matches = [];    vscode.window.tabGroups.all.forEach((group, g) => {
         group.tabs.forEach((tab, i) => {
             const p = describeUri(tab.input && tab.input.uri);
             if (args.index !== undefined && args.group !== undefined) {
                 if (g === args.group && i === args.index) matches.push(tab);
-            } else if (args.path && p && p.toLowerCase() === String(args.path).toLowerCase()) {
+            } else if (args.path && p && (p.toLowerCase() === String(args.path).toLowerCase() || p.toLowerCase() === wantFsPath(args.path))) {
                 matches.push(tab);
             } else if (args.name && tab.label === args.name) {
                 matches.push(tab);
