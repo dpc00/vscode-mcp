@@ -286,6 +286,21 @@ function jsonOf(reply) { return JSON.parse(textOf(reply)); }
         return 'default_surface';
     });
 
+    // ── loop guard: identical failures trip the breaker, loop_reset clears it ────────────
+    await checkAsync('loop guard trips and resets', async () => {
+        const fake = { name: 'zz_loop_probe', run: async () => ({ ok: false, error: 'always fails the same way' }) };
+        ext.guarded(fake);
+        let last;
+        for (let i = 0; i < 5; i++) last = await fake.run({});
+        must(last && last.loop_breaker === true, '5th identical failure did not trip: ' + JSON.stringify(last).slice(0, 160));
+        const cleared = await ext.TOOLS.find((t) => t.name === 'loop_reset').run({ tool: 'zz_loop_probe' });
+        must(cleared && cleared.cleared >= 1, 'loop_reset cleared nothing: ' + JSON.stringify(cleared));
+        const again = await fake.run({});
+        must(again && !again.loop_breaker, 'guard still tripped after loop_reset');
+        // a different failure signature restarts the streak instead of tripping
+        return 'tripped at 4, reset clears';
+    });
+
     console.log('');
     if (failures.length) {
         console.log(failures.length + ' failed:');

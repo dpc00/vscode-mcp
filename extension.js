@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.9.0';
+const VERSION = '0.9.1';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -230,6 +230,94 @@ async function dispatchCommand(id, args) {
     return winner.result;
 }
 
+// -- loop guard ------------------------------------------------------------------------------
+// The 2026-11-13 vscode-extension-audit report: an agent installed tomoki1207.pdf, then
+// repeated install_extension/reload_window/list_extensions/activate_extension/run_command
+// for ~2 hours - every call looked reasonable alone, the set never progressed, and nothing
+// in the tool surface could say "stop, this is a loop". The guard fingerprints every tool
+// call (name + arguments); the same call failing the same way LOOP_BREAK_AFTER times inside
+// LOOP_WINDOW_MS answers loop_breaker instead of running again. Success, a different
+// result, or different arguments ends the streak; a pending:true result (a dialog is up -
+// waiting is the point) neither counts nor clears. batch calls are guarded too: each item
+// goes through the same wrapped run.
+const LOOP_BREAK_AFTER = 4;
+const LOOP_WINDOW_MS = 15 * 60 * 1000;
+const loopState = new Map(); // name + '|' + argsKey -> { sig, streak, last }
+
+function stableString(v) {
+    if (Array.isArray(v)) return '[' + v.map(stableString).join(',') + ']';
+    if (v && typeof v === 'object') {
+        return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stableString(v[k])).join(',') + '}';
+    }
+    return JSON.stringify(v === undefined ? null : v);
+}
+
+function failureSignature(result, thrown) {
+    if (thrown) return 'thrown:' + String(thrown && thrown.message || thrown).slice(0, 160);
+    if (result && typeof result === 'object') {
+        if (typeof result.error === 'string') return 'error:' + result.error.slice(0, 160);
+        if (result.ok === false && !result.pending) {
+            const shape = {};
+            for (const k of Object.keys(result).sort()) {
+                if (k === 'ms' || k === 'dialogs' || k === 'dialogs_error') continue;
+                shape[k] = result[k] && typeof result[k] === 'object' ? '[obj]' : result[k];
+            }
+            return 'notok:' + stableString(shape).slice(0, 160);
+        }
+    }
+    return null;
+}
+
+function guarded(tool) {
+    if (!tool || tool.guarded) return tool;
+    const inner = tool.run;
+    tool.run = async (a) => {
+        const args = a || {};
+        const key = tool.name + '|' + stableString(args).slice(0, 500);
+        const now = Date.now();
+        const prior = loopState.get(key);
+        const live = prior && now - prior.last <= LOOP_WINDOW_MS ? prior : null;
+        if (live && live.streak >= LOOP_BREAK_AFTER) {
+            return {
+                loop_breaker: true,
+                tool: tool.name,
+                note: 'this exact call has already failed ' + live.streak + ' times in a row with the same result. '
+                    + 'Repeating it cannot produce a different answer - change the approach: read the error, try a '
+                    + 'different tool or command, inspect state with get_help/list_extensions/read_log, or report '
+                    + 'the blocker. loop_reset({tool:"' + tool.name + '"}) clears this if the situation genuinely changed.',
+                last_error: live.sig,
+                streak: live.streak,
+            };
+        }
+        let result, thrown = null;
+        try { result = await inner(args); } catch (e) { thrown = e; }
+        const sig = failureSignature(result, thrown);
+        if (sig) {
+            const streak = (live && live.sig === sig) ? live.streak + 1 : 1;
+            loopState.set(key, { sig, streak, last: now });
+        } else if (live) {
+            // A success ends any failure streak for this exact call. A pending:true result
+            // (dialog up) is a success-shaped non-failure: it neither counts nor clears.
+            loopState.delete(key);
+        }
+        if (loopState.size > 400) {
+            for (const [k, e] of loopState) if (now - e.last > LOOP_WINDOW_MS) loopState.delete(k);
+        }
+        if (thrown) throw thrown;
+        return result;
+    };
+    tool.guarded = true;
+    return tool;
+}
+
+function guardClear(name) {
+    let n = 0;
+    for (const k of Array.from(loopState.keys())) {
+        if (!name || k.startsWith(name + '|')) { loopState.delete(k); n++; }
+    }
+    return n;
+}
+
 // PostMessage queues; the modal loop needs a beat to process the click before the
 // verification re-enumeration runs (the PowerShell version got this delay for free
 // from its process spawn).
@@ -265,6 +353,7 @@ const TOOLS = [
                     expose_all_tools: exposeAllTools(),
                     why: 'tools/list presents only the core tools. The rest are callable by name through batch, found with discover - a full list would be thousands of tool schemas in the client context before the first message, which a limited-context model cannot afford (and cannot compact around).',
                 },
+                loop_guard: 'Every tool call is fingerprinted; the same call failing identically ' + LOOP_BREAK_AFTER + ' times inside 15 minutes answers loop_breaker instead of running again. Change approach, or call loop_reset({tool}) once the situation has genuinely changed.',
                 gaps: [
                     'No tool reads or *picks items* in a quick pick opened by another extension (API limit). Quick picks are drivable: workbench.action.quickOpen + quickOpenSelectNext/accept/closeQuickOpen (see README and self_test).',
                     'No screenshots from inside the extension host (use external tool).',
@@ -762,6 +851,21 @@ const TOOLS = [
                 must(Array.isArray(r) && r.length === 1 && r[0] && r[0].server, 'batch failed: ' + JSON.stringify(r).slice(0, 160));
                 return 'nested call ok';
             });
+            await check('loop_guard', async () => {
+                // The 2026-11-13 report: an agent repeated a failing call for hours because
+                // nothing in the surface could say stop. The guard must fire on the 4th
+                // identical failure and loop_reset must clear it.
+                const bad = { command: 'vscode-mcp.selftest.no-such-command' };
+                let last;
+                for (let i = 0; i < 5; i++) last = await by.get('run_command').run(bad);
+                must(last && last.loop_breaker === true, '5th identical failure did not trip the guard: ' + JSON.stringify(last).slice(0, 160));
+                const cleared = await by.get('loop_reset').run({ tool: 'run_command' });
+                must(cleared && cleared.ok, 'loop_reset failed: ' + JSON.stringify(cleared));
+                const again = await by.get('run_command').run(bad);
+                must(again && !again.loop_breaker, 'guard still tripped after loop_reset');
+                await by.get('loop_reset').run({});
+                return 'tripped, reset clears';
+            });
             await check('close + cleanup', async () => {
                 try { await by.get('close_file').run({ path: js, discard: true }); } catch (e) {}
                 try { await by.get('close_file').run({ path: f, discard: true }); } catch (e) {}
@@ -908,6 +1012,12 @@ const TOOLS = [
             return { ok: true };
         },
     },
+    {
+        name: 'loop_reset',
+        description: 'Clears the loop guard\'s failure streaks so a tool that kept failing can be tried again after the situation changed (an extension finished installing, a dialog was answered, a reload happened). Without a tool name every streak is cleared. The guard itself is not a failure: it fires only after the same call fails identically LOOP_BREAK_AFTER times inside 15 minutes, and the loop_breaker result names loop_reset as the way through.',
+        inputSchema: { type: 'object', properties: { tool: { type: 'string', description: 'clear only this tool\'s streaks' } } },
+        run: async (a) => ({ ok: true, cleared: guardClear(a && a.tool) }),
+    },
 ];
 
 // -- the default tool surface ----------------------------------------------------------------
@@ -936,6 +1046,7 @@ const DEFAULT_TOOL_NAMES = [
     'replace_text',
     'save_file',
     'expect',
+    'loop_reset',
 ];
 
 function exposeAllTools() {
@@ -1278,6 +1389,7 @@ function activate(context) {
     server = startServer(output);
     buildCommandTools().then((gen) => {
         TOOLS.push(...gen);
+        for (const t of TOOLS) guarded(t);
         output.appendLine('generated ' + gen.length + ' command tools; ' + TOOLS.length + ' tools in all');
     }, (e) => output.appendLine('command tool generation failed: ' + String((e && e.message) || e)));
     context.subscriptions.push(
@@ -1297,4 +1409,4 @@ function deactivate() {
 // handleRpc and TOOLS are exported so a plain Node process can drive the protocol without a
 // VS Code window (tools/test_surface.js stubs the vscode module), and so self_test can assert the
 // presented surface. They are not part of the extension API.
-module.exports = { activate, deactivate, handleRpc, TOOLS, DEFAULT_TOOL_NAMES, listedTools };
+module.exports = { activate, deactivate, handleRpc, TOOLS, DEFAULT_TOOL_NAMES, listedTools, guarded, guardClear, loopState };
