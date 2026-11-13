@@ -2,7 +2,7 @@
   "name": "vscode-mcp",
   "displayName": "VS Code MCP",
   "description": "Exposes VS Code's own commands, tabs, text and extensions to an agent over MCP, like sublime-mcp does for Sublime Text.",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "publisher": "dpc00",
   "license": "MIT",
   "engines": {
@@ -47,6 +47,11 @@
           "type": "string",
           "default": "",
           "description": "User data folder this VS Code was started with (--user-data-dir), passed to VS Code's CLI the same way. Empty means the CLI's default."
+        },
+        "vscodeMcp.exposeAllTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "Present every tool in tools/list instead of the core surface plus discover. Off by default: the full list is thousands of tool schemas (one per VS Code command id) and fills a limited-context client before the first message, leaving no room to compact. A client that refuses a tool it was not told about does not need this - batch is always listed and runs any tool by name."
         }
       }
     }

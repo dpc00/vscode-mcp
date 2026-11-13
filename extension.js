@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.8.4';
+const VERSION = '0.9.0';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -246,24 +246,35 @@ try { COMMAND_BEHAVIOR = JSON.parse(fs.readFileSync(path.join(__dirname, 'comman
 const TOOLS = [
     {
         name: 'get_help',
-        description: 'Describes this server and its tools, and the gaps compared with sublime-mcp. Also reports pid, started_at and uptime_ms so a client can tell a restarted extension host from the one it was talking to before reload_window:',
+        description: 'Describes this server and its tools, and the gaps compared with sublime-mcp. Also reports what tools/list presents and what stays callable behind discover, plus pid, started_at and uptime_ms so a client can tell a restarted extension host from the one it was talking to before reload_window:',
         inputSchema: { type: 'object', properties: {} },
-        run: async () => ({
-            server: 'vscode-mcp ' + VERSION,
-            pid: process.pid,
-            started_at: STARTED_AT,
-            uptime_ms: Date.now() - STARTED_AT,
-            vscode: vscode.version,
-            what: 'Runs inside the VS Code extension host. Every VS Code command is reachable with run_command; list_commands finds them.',
-            gaps: [
-                'No tool reads or *picks items* in a quick pick opened by another extension (API limit). Quick picks are drivable: workbench.action.quickOpen + quickOpenSelectNext/accept/closeQuickOpen (see README and self_test).',
-                'No screenshots from inside the extension host (use external tool).',
-                'Cannot read *content* of other extensions\' output channels (API limit). Drive showOutputChannels; use read_log for host logs.',
-            ],
-            tools_hand_written: TOOLS.filter(t => !t.generated).map(t => t.name),
-            tools_count: TOOLS.length,
-            generated: 'Every tool above the hand-written list is a GENERATED VS Code command tool, one per command id, dispatched as-is. Find them with discover {query}; run them with {"args": [...]} exactly like run_command.',
-        }),
+        run: async () => {
+            const listed = listedTools();
+            return {
+                server: 'vscode-mcp ' + VERSION,
+                pid: process.pid,
+                started_at: STARTED_AT,
+                uptime_ms: Date.now() - STARTED_AT,
+                vscode: vscode.version,
+                what: 'Runs inside the VS Code extension host. Every VS Code command is reachable; discover finds them.',
+                surface: {
+                    listed: listed.map(t => t.name),
+                    listed_count: listed.length,
+                    hidden_count: TOOLS.length - listed.length,
+                    generated_count: TOOLS.filter(t => t.generated).length,
+                    expose_all_tools: exposeAllTools(),
+                    why: 'tools/list presents only the core tools. The rest are callable by name through batch, found with discover - a full list would be thousands of tool schemas in the client context before the first message, which a limited-context model cannot afford (and cannot compact around).',
+                },
+                gaps: [
+                    'No tool reads or *picks items* in a quick pick opened by another extension (API limit). Quick picks are drivable: workbench.action.quickOpen + quickOpenSelectNext/accept/closeQuickOpen (see README and self_test).',
+                    'No screenshots from inside the extension host (use external tool).',
+                    'Cannot read *content* of other extensions\' output channels (API limit). Drive showOutputChannels; use read_log for host logs.',
+                ],
+                tools_hand_written: TOOLS.filter(t => !t.generated).map(t => t.name),
+                tools_count: TOOLS.length,
+                generated: 'Every VS Code command is a GENERATED tool, one per command id. discover({"query":"<words>"}) finds one; run it with {"args": [...]} exactly like run_command, through batch.',
+            };
+        },
     },
     {
         name: 'list_commands',
@@ -447,21 +458,22 @@ const TOOLS = [
     },
     {
         name: 'discover',
-        description: 'Finds tools by case-insensitive regular expression on name or description, over every tool INCLUDING the generated VS Code command tools (one per command id). Returns total and up to limit (default 30) matches as {name, generated, command, description}. This is how a 1000-tool surface stays usable: never scroll a list, search it.',
-        inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] },
+        description: 'Finds tools. Give query (case-insensitive regular expression over name, VS Code command id and description) to search the whole catalogue - including the thousands of generated command tools, one per VS Code command - or category to browse it (omit both for the top-level map). Each hit carries its inputSchema, so the next call is right the first time. Run a hit through batch, even for one call: batch({"calls":[{"tool":"<name>","arguments":{...}}]}). This is how a thousand-tool surface stays usable in a small context: never scroll a list, search it.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: 'Regular expression, e.g. "fold" or "git.*commit".' },
+                category: { type: 'string', description: 'A path from the map: "hand-written", or a command-id prefix such as "workbench" / "workbench/action".' },
+                limit: { type: 'number', description: 'default 30 for a query, 40 for a category; max 200' },
+                include_schema: { type: 'boolean', description: 'default true' },
+            },
+        },
         run: async (a) => {
-            const re = new RegExp(String(a.query), 'i');
-            const limit = Math.min(a.limit || 30, 200);
-            const matches = TOOLS.filter(t => re.test(t.name) || re.test(t.description || ''));
-            return {
-                total: matches.length,
-                tools: matches.slice(0, limit).map(t => ({
-                    name: t.name,
-                    generated: !!t.generated,
-                    command: t.commandId,
-                    description: (t.description || '').slice(0, 160),
-                })),
-            };
+            const isQuery = a.category === undefined && a.query !== undefined && String(a.query).trim() !== '';
+            const limit = Math.max(1, Math.min(Number(a.limit) || (isQuery ? 30 : 40), 200));
+            const includeSchema = a.include_schema !== false;
+            if (!isQuery) return discoverByCategory(a.category, limit, includeSchema);
+            return findTools(String(a.query).trim(), limit, includeSchema);
         },
     },
     {
@@ -553,7 +565,7 @@ const TOOLS = [
     },
     {
         name: 'batch',
-        description: 'Runs several tool calls in order in ONE request and returns one result per call: calls is a list of {tool, arguments} or {sleep: milliseconds}. Stops at the first error unless keep_going is true. Saves the round trip of every step of a test (create, open, edit, complete, diagnostics).',
+        description: 'Runs several tool calls in order in ONE request and returns one result per call: calls is a list of {tool, arguments} or {sleep: milliseconds}. Runs ANY tool by name, including the thousands that tools/list does not present, so it is also the way to call what discover just found. Stops at the first error unless keep_going is true. Saves the round trip of every step of a test (create, open, edit, complete, diagnostics).',
         inputSchema: { type: 'object', properties: { calls: { type: 'array', items: { type: 'object' } }, keep_going: { type: 'boolean' } }, required: ['calls'] },
         run: async (a) => {
             const results = [];
@@ -660,6 +672,24 @@ const TOOLS = [
                 const cmds = await vscode.commands.getCommands(true);
                 must(cmds.length > 500, 'only ' + cmds.length + ' commands');
                 return vscode.version + ', ' + cmds.length + ' commands';
+            });
+            await check('default_surface', async () => {
+                // The regression guard for the context bomb: a client must never be handed the
+                // whole catalogue, and a tool it was NOT handed must still run through batch.
+                const list = await handleRpc({ id: 1, method: 'tools/list' });
+                const names = list.result.tools.map((t) => t.name);
+                must(names.length > 0 && names.length <= DEFAULT_TOOL_NAMES.length,
+                    'tools/list presents ' + names.length + ' tools');
+                must(names.includes('batch') && names.includes('discover'), 'discover and batch must be listed');
+                const d = await by.get('discover').run({ query: 'selectAll', limit: 5 });
+                must(d && d.tools && d.tools.length > 0, 'discover found no selectAll tool');
+                const hit = d.tools[0];
+                must(hit.inputSchema, 'discover returned no inputSchema');
+                must(names.indexOf(hit.name) < 0, 'the probe tool is already listed; pick a hidden one');
+                const r = await by.get('batch').run({ calls: [{ tool: hit.name, arguments: {} }] });
+                must(Array.isArray(r) && r[0] && !r[0].error,
+                    'batch could not run a discovered tool: ' + JSON.stringify(r).slice(0, 160));
+                return names.length + ' listed, ' + TOOLS.length + ' callable';
             });
             await check('create_file', async () => {
                 const r = await by.get('create_file').run({ path: f, content: 'one two three', overwrite: true });
@@ -880,6 +910,214 @@ const TOOLS = [
     },
 ];
 
+// -- the default tool surface ----------------------------------------------------------------
+// tools/list answers with this list and nothing else. Every other tool - the rest of the
+// hand-written ones and every generated VS Code command tool (thousands of them) - stays
+// callable by name, found with discover. Presenting all of them costs a whole context window
+// before the first message (2824 generated tools on VS Code 1.144, each an object with a
+// schema) and leaves a limited-context client no room to compact: the 2026-11-13 report was a
+// session that hit 100% as soon as this server connected and could not compact while it was.
+// sublime-commander's default surface is the pattern being followed: a dozen tools in the list,
+// the rest behind one discovery tool, called through batch.
+//
+// A client that refuses a tool it was not told about does not need vscodeMcp.exposeAllTools:
+// batch IS listed and takes any tool name, so a discovered tool always has a way in. The
+// setting exists only for a client whose batch-style call is itself unusable.
+const DEFAULT_TOOL_NAMES = [
+    'get_help',
+    'discover',
+    'batch',
+    'run_command',
+    'get_open_files',
+    'get_active_file',
+    'get_text',
+    'open_file',
+    'create_file',
+    'replace_text',
+    'save_file',
+    'expect',
+];
+
+function exposeAllTools() {
+    try { return vscode.workspace.getConfiguration('vscodeMcp').get('exposeAllTools', false) === true; } catch (e) { return false; }
+}
+
+// The tools tools/list presents, in DEFAULT_TOOL_NAMES order. Never throws and never returns
+// an empty list: a surface that forgot its own entry points is worse than a big one.
+function listedTools() {
+    if (exposeAllTools()) return TOOLS.slice();
+    const out = [];
+    for (const name of DEFAULT_TOOL_NAMES) {
+        const tool = TOOLS.find((t) => t.name === name);
+        if (tool) out.push(tool);
+    }
+    return out;
+}
+
+function toolListing(tool) {
+    return {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema || { type: 'object', properties: {} },
+    };
+}
+
+const SURFACE_USAGE = 'Call a discovered tool through batch, even for a single call: '
+    + 'batch({"calls":[{"tool":"<name>","arguments":{...}}]}). discover returns each hit\'s inputSchema, so the call is right the first time.';
+
+// -- discovery -------------------------------------------------------------------------------
+// The catalogue is one flat list of a few thousand tools; browsing it as a tree is what keeps
+// it navigable without a query. Two families: 'hand-written' (the tools written for this
+// server) and one category per leading command-id segment ('workbench', 'editor', 'git', ...),
+// descending a dot at a time ('workbench/action', 'workbench/action/files').
+
+const DISCOVER_DESCRIPTION_CHARS = 200;
+const MAP_CATEGORIES = 24;
+
+function hitOf(tool, includeSchema) {
+    const text = String(tool.description || '');
+    const hit = {
+        name: tool.name,
+        description: text.length > DISCOVER_DESCRIPTION_CHARS
+            ? text.slice(0, DISCOVER_DESCRIPTION_CHARS) + '...'
+            : text,
+        generated: !!tool.generated,
+    };
+    if (tool.commandId) hit.command = tool.commandId;
+    if (includeSchema) hit.inputSchema = tool.inputSchema || { type: 'object', properties: {} };
+    return hit;
+}
+
+function commandSegments(tool) {
+    return tool.generated ? String(tool.commandId || '').split('.') : [];
+}
+
+// Tools whose command id starts with every segment of `parts` (exactly or followed by a dot).
+function commandToolsUnder(parts) {
+    return TOOLS.filter((tool) => {
+        const segs = commandSegments(tool);
+        if (segs.length < parts.length) return false;
+        for (let i = 0; i < parts.length; i++) if (segs[i] !== parts[i]) return false;
+        return true;
+    });
+}
+
+function catalogMap() {
+    const written = TOOLS.filter((t) => !t.generated).length;
+    const counts = new Map();
+    for (const tool of TOOLS) {
+        const segs = commandSegments(tool);
+        if (!segs.length || !segs[0]) continue;
+        counts.set(segs[0], (counts.get(segs[0]) || 0) + 1);
+    }
+    // A machine with many extensions contributes a namespace each; the biggest few are the map,
+    // and a query is the way to reach the rest. A map of 200 namespaces would cost more context
+    // than it saves.
+    const ordered = Array.from(counts).sort((x, y) => (y[1] - x[1]) || x[0].localeCompare(y[0]));
+    const shown = ordered.slice(0, MAP_CATEGORIES);
+    const categories = [{
+        path: 'hand-written',
+        tools: written,
+        description: 'the tools written for this server: files, tabs, text, commands, dialogs, tests',
+    }];
+    for (const [seg, n] of shown) {
+        categories.push({ path: seg, tools: n, description: 'generated command tools whose command id starts with ' + seg + '.' });
+    }
+    return {
+        total: TOOLS.length,
+        hand_written: written,
+        generated: TOOLS.length - written,
+        categories,
+        namespaces_omitted: ordered.length - shown.length,
+        usage: 'discover({"category":"<path>"}) lists a category and descends with "/" (e.g. workbench/action); '
+             + 'discover({"query":"<words>"}) searches every tool, generated ones included. ' + SURFACE_USAGE,
+    };
+}
+
+function discoverByCategory(pathText, limit, includeSchema) {
+    const parts = String(pathText || '').replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+    if (!parts.length) return catalogMap();
+    if (parts[0] === 'hand-written') {
+        if (parts.length > 1) return { error: 'unknown category ' + pathText, categories: ['hand-written'] };
+        const written = TOOLS.filter((t) => !t.generated);
+        return {
+            path: 'hand-written',
+            total: written.length,
+            tools: written.slice(0, limit).map((t) => hitOf(t, includeSchema)),
+            usage: SURFACE_USAGE,
+        };
+    }
+    const under = commandToolsUnder(parts);
+    if (!under.length) return { error: 'no command tools under ' + pathText, map: catalogMap().categories };
+    const subs = new Map();
+    const direct = [];
+    for (const tool of under) {
+        const segs = commandSegments(tool);
+        // A command id is namespace.area...commandName: the LAST segment is the command, so a
+        // tool sits directly at this path when only that one segment follows it
+        // (workbench.action.showCommands is direct at workbench/action;
+        // workbench.action.files.save is one level deeper, at workbench/action/files).
+        if (segs.length === parts.length + 1) direct.push(tool);
+        else subs.set(segs[parts.length], (subs.get(segs[parts.length]) || 0) + 1);
+    }
+    const out = { path: parts.join('/'), total: under.length };
+    if (subs.size) {
+        out.subcategories = Array.from(subs, ([seg, n]) => ({ path: parts.join('/') + '/' + seg, tools: n }))
+            .sort((x, y) => (y.tools - x.tools) || x.path.localeCompare(y.path));
+    }
+    const shown = direct.slice(0, limit);
+    if (shown.length) out.tools = shown.map((t) => hitOf(t, includeSchema));
+    if (direct.length > shown.length) out.shown = shown.length;
+    out.usage = subs.size
+        ? 'descend into a subcategory path, or search with discover({"query":"<words>"}). ' + SURFACE_USAGE
+        : SURFACE_USAGE;
+    return out;
+}
+
+// A query hit scores by where it matched: a whole segment of the tool name (the `fold` of
+// `editor_fold`) beats a segment that starts with it (`foldAll`), which beats a substring
+// (`addRootFolder`), which beats the description - and the command id counts the same way, one
+// tier lower. Without that, a one-word query is decided alphabetically across 2800 tools, and
+// `addRootFolder` comes before `editor_fold`.
+function findTools(queryText, limit, includeSchema) {
+    let re;
+    let exactSegment;
+    try {
+        re = new RegExp(queryText, 'i');
+        exactSegment = new RegExp('^(?:' + queryText + ')$', 'i');
+    } catch (e) { throw new Error('bad query regular expression: ' + e.message); }
+    const qLower = queryText.toLowerCase();
+    const tiers = (text, whole, prefix, any) => {
+        if (!text) return 0;
+        let best = re.test(text) ? any : 0;
+        for (const seg of String(text).split(/[._]/)) {
+            if (!seg) continue;
+            if (exactSegment.test(seg)) best = Math.max(best, whole);
+            else if (seg.toLowerCase().startsWith(qLower)) best = Math.max(best, prefix);
+        }
+        return best;
+    };
+    const scored = [];
+    for (const tool of TOOLS) {
+        const score = tiers(tool.name, 80, 60, 30)
+            + tiers(String(tool.commandId || ''), 40, 30, 15)
+            + (re.test(String(tool.description || '')) ? 3 : 0);
+        if (score) scored.push({ score, tool });
+    }
+    scored.sort((x, y) => (y.score - x.score)
+        || (x.tool.name.length - y.tool.name.length)
+        || x.tool.name.localeCompare(y.tool.name));
+    const tools = scored.slice(0, limit).map((entry) => hitOf(entry.tool, includeSchema));
+    return {
+        query: queryText,
+        total: scored.length,
+        shown: tools.length,
+        tools,
+        hint: scored.length > tools.length ? 'narrow the query, or raise limit (max 200)' : undefined,
+        usage: SURFACE_USAGE,
+    };
+}
+
 function ok(id, result) {
     return { jsonrpc: '2.0', id, result };
 }
@@ -895,16 +1133,27 @@ async function handleRpc(msg) {
             protocolVersion: (params && params.protocolVersion) || '2025-03-26',
             capabilities: { tools: {} },
             serverInfo: { name: 'vscode-mcp', version: VERSION },
-            instructions: 'Call get_help first. Close tabs by name, path or group+index only.',
+            instructions: 'Call get_help first. Discovery-first surface: tools/list presents only the '
+                + DEFAULT_TOOL_NAMES.length + ' core tools; every other tool (and the thousands of generated VS Code '
+                + 'command tools, one per command id) is hidden from the list but callable. Find one with '
+                + 'discover({"query":"<words>"}) or discover({"category":"<path>"}), then run it through '
+                + 'batch({"calls":[{"tool":"<name>","arguments":{...}}]}) even for a single call. '
+                + 'Close tabs by name, path or group+index only.',
         });
     }
     if (method === 'ping') return ok(id, {});
     if (method === 'tools/list') {
-        return ok(id, { tools: TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+        return ok(id, { tools: listedTools().map(toolListing), ttlMs: 0, cacheScope: 'private' });
     }
     if (method === 'tools/call') {
-        const tool = TOOLS.find(t => t.name === (params && params.name));
-        if (!tool) return rpcError(id, -32602, 'unknown tool ' + (params && params.name));
+        const name = params && params.name;
+        const tool = TOOLS.find(t => t.name === name);
+        if (!tool) {
+            return rpcError(id, -32602, 'unknown tool ' + name + ' - find it with discover({"query":"<words>"}) or '
+                + 'discover({"category":"hand-written"}), then call it through batch');
+        }
+        // Dispatch is by name over the whole catalogue, not over the presented list: a tool that
+        // discover found must run whether or not the client was told about it.
         try {
             const value = await tool.run((params && params.arguments) || {});
             return ok(id, { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] });
@@ -1045,4 +1294,7 @@ function deactivate() {
     if (server) server.close();
 }
 
-module.exports = { activate, deactivate };
+// handleRpc and TOOLS are exported so a plain Node process can drive the protocol without a
+// VS Code window (tools/test_surface.js stubs the vscode module), and so self_test can assert the
+// presented surface. They are not part of the extension API.
+module.exports = { activate, deactivate, handleRpc, TOOLS, DEFAULT_TOOL_NAMES, listedTools };
