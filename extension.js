@@ -256,9 +256,9 @@ const TOOLS = [
             vscode: vscode.version,
             what: 'Runs inside the VS Code extension host. Every VS Code command is reachable with run_command; list_commands finds them.',
             gaps: [
-                'No tool reads or picks items in a quick pick opened by another extension (the API does not expose it).',
-                'No screenshots from inside the extension host; use an external screenshot tool.',
-                'Output channels of other extensions cannot be read through the API.',
+                'No tool reads or *picks items* in a quick pick opened by another extension (API limit). Quick picks are drivable: workbench.action.quickOpen + quickOpenSelectNext/accept/closeQuickOpen (see README and self_test).',
+                'No screenshots from inside the extension host (use external tool).',
+                'Cannot read *content* of other extensions\' output channels (API limit). Drive showOutputChannels; use read_log for host logs.',
             ],
             tools_hand_written: TOOLS.filter(t => !t.generated).map(t => t.name),
             tools_count: TOOLS.length,
@@ -711,6 +711,21 @@ const TOOLS = [
                 const r = await by.get('get_diagnostics').run({ path: f });
                 must(Array.isArray(r), 'diagnostics not an array: ' + JSON.stringify(r).slice(0, 160));
                 return r.length + ' diagnostics';
+            });
+            await check('quick_pick_drive', async () => {
+                // Drive a quick open picker using standard commands (items themselves are not readable via API - known gap)
+                await by.get('run_command').run({ command: 'workbench.action.quickOpen' });
+                await sleep(400);
+                await by.get('run_command').run({ command: 'workbench.action.quickOpenSelectNext' });
+                await by.get('run_command').run({ command: 'workbench.action.closeQuickOpen' });
+                return 'opened, navigated, closed';
+            });
+            await check('output_channel_show', async () => {
+                // Drive showing output channels (content of other extensions' channels remains unreadable via API - known gap)
+                await by.get('run_command').run({ command: 'workbench.action.showOutputChannels' });
+                await sleep(300);
+                await by.get('run_command').run({ command: 'workbench.action.closeQuickOpen' }); // in case it opened as picker
+                return 'show driven';
             });
             await check('batch', async () => {
                 const r = await by.get('batch').run({ calls: [{ tool: 'get_help', arguments: {} }] });
