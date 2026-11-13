@@ -853,15 +853,21 @@ const TOOLS = [
             });
             await check('loop_guard', async () => {
                 // The 2026-11-13 report: an agent repeated a failing call for hours because
-                // nothing in the surface could say stop. The guard must fire on the 4th
-                // identical failure and loop_reset must clear it.
+                // nothing in the surface could say stop. run_command THROWS on an unknown
+                // command (the MCP layer turns that into isError), so the check collects
+                // thrown errors as the failures they are; the guard must still trip on the
+                // 4th identical one and loop_reset must clear it.
                 const bad = { command: 'vscode-mcp.selftest.no-such-command' };
+                const attempt = async () => {
+                    try { return await by.get('run_command').run(bad); }
+                    catch (e) { return { thrown: String((e && e.message) || e) }; }
+                };
                 let last;
-                for (let i = 0; i < 5; i++) last = await by.get('run_command').run(bad);
+                for (let i = 0; i < 5; i++) last = await attempt();
                 must(last && last.loop_breaker === true, '5th identical failure did not trip the guard: ' + JSON.stringify(last).slice(0, 160));
                 const cleared = await by.get('loop_reset').run({ tool: 'run_command' });
                 must(cleared && cleared.ok, 'loop_reset failed: ' + JSON.stringify(cleared));
-                const again = await by.get('run_command').run(bad);
+                const again = await attempt();
                 must(again && !again.loop_breaker, 'guard still tripped after loop_reset');
                 await by.get('loop_reset').run({});
                 return 'tripped, reset clears';
