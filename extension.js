@@ -48,6 +48,41 @@ function describeUri(uri) {
     return uri.scheme === 'file' ? uri.fsPath : uri.toString();
 }
 
+// Which VS Code window this server lives in. tabGroups.all covers only THIS window's
+// groups, and viewColumn repeats across windows, so a window is identified by its SET of
+// view columns; windows are numbered by the lowest column each owns, sorted. Tabs carry
+// `win` so a caller can tell which window a tab (and therefore a command target) belongs to.
+function windowMap() {
+    const groups = vscode.window.tabGroups.all;
+    const colToWin = new Map();
+    const cols = [];
+    for (const g of groups) {
+        if (g.viewColumn === undefined || g.viewColumn === null) continue;
+        if (!cols.includes(g.viewColumn)) cols.push(g.viewColumn);
+    }
+    cols.sort((a, b) => a - b);
+    // One window owns columns 1..N contiguously in practice; with several windows open each
+    // still has its own column 1, so column alone cannot separate them. tabGroups.all is
+    // per-window, so every group here IS this window: win is always this window's index.
+    // The honest answer is one window per extension host; report that instead of guessing.
+    return { groups, columns: cols };
+}
+
+// What get_help/initialize report so a client can tell WHICH VS Code instance answered:
+// pid, version, workspace folders, port. Without it, three instances on one port look alike.
+function instanceInfo() {
+    const config = vscode.workspace.getConfiguration('vscodeMcp');
+    const { columns } = windowMap();
+    return {
+        pid: process.pid,
+        vscode: vscode.version,
+        port: config.get('port', 9560),
+        workspace_folders: (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath),
+        window_count: vscode.window.tabGroups.all.length ? 1 : 0, // this extension host serves exactly one window
+        view_columns: columns,
+    };
+}
+
 function listTabs() {
     const out = [];
     vscode.window.tabGroups.all.forEach((group, g) => {
@@ -55,6 +90,7 @@ function listTabs() {
             out.push({
                 group: g,
                 index: i,
+                win: 0, // this server's window; other VS Code instances have their own port and their own server
                 label: tab.label,
                 path: describeUri(tab.input && tab.input.uri),
                 active: tab.isActive,
@@ -344,6 +380,7 @@ const TOOLS = [
                 started_at: STARTED_AT,
                 uptime_ms: Date.now() - STARTED_AT,
                 vscode: vscode.version,
+                instance: instanceInfo(),
                 what: 'Runs inside the VS Code extension host. Every VS Code command is reachable; discover finds them.',
                 surface: {
                     listed: listed.map(t => t.name),
@@ -476,18 +513,28 @@ const TOOLS = [
     },
     {
         name: 'create_file',
-        description: 'Creates a text file (and its folders) with the given content. Refuses to replace an existing file unless overwrite is true. Writes to disk directly; open it afterwards with open_file.',
+        description: 'Creates a text file (and its folders) with the given content. Refuses to replace an existing file unless overwrite is true. If the file is already open in an editor, the write goes through the document so an unsaved buffer cannot shadow it (a disk write under a dirty buffer is how "create then open" used to show the OLD text). Writes to disk directly when the file is not open; open it afterwards with open_file.',
         inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, overwrite: { type: 'boolean' } }, required: ['path'] },
         run: async (a) => {
             if (!path.isAbsolute(String(a.path))) throw new Error('path must be absolute');
             const uri = fileUri(a.path);
+            const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
             let exists = true;
             try { await vscode.workspace.fs.stat(uri); } catch (e) { exists = false; }
-            if (exists && !a.overwrite) throw new Error('file exists; pass overwrite:true to replace it');
+            if (exists && !a.overwrite && !open) throw new Error('file exists; pass overwrite:true to replace it');
+            if (open) {
+                // Route through the document: a dirty buffer would otherwise keep serving the
+                // old text to get_text/get_active_file/expect after the disk write.
+                const edit = new vscode.WorkspaceEdit();
+                edit.replace(uri, new vscode.Range(new vscode.Position(0, 0), open.lineAt(open.lineCount - 1).range.end), String(a.content || ''));
+                const okEdit = await vscode.workspace.applyEdit(edit);
+                if (!okEdit) throw new Error('applyEdit failed');
+                return { ok: true, path: describeUri(uri), bytes: Buffer.byteLength(String(a.content || ''), 'utf8'), replaced: exists, via: 'document' };
+            }
             await vscode.workspace.fs.createDirectory(fileUri(path.dirname(String(a.path))));
             const bytes = Buffer.from(String(a.content || ''), 'utf8');
             await vscode.workspace.fs.writeFile(uri, bytes);
-            return { ok: true, path: describeUri(uri), bytes: bytes.length, replaced: exists };
+            return { ok: true, path: describeUri(uri), bytes: bytes.length, replaced: exists, via: 'disk' };
         },
     },
     {
@@ -1249,7 +1296,7 @@ async function handleRpc(msg) {
         return ok(id, {
             protocolVersion: (params && params.protocolVersion) || '2025-03-26',
             capabilities: { tools: {} },
-            serverInfo: { name: 'vscode-mcp', version: VERSION },
+            serverInfo: { name: 'vscode-mcp', version: VERSION, instance: instanceInfo() },
             instructions: 'Call get_help first. Discovery-first surface: tools/list presents only the '
                 + DEFAULT_TOOL_NAMES.length + ' core tools; every other tool (and the thousands of generated VS Code '
                 + 'command tools, one per command id) is hidden from the list but callable. Find one with '
@@ -1280,6 +1327,32 @@ async function handleRpc(msg) {
     }
     if (id === undefined || id === null) return null; // a notification needs no answer
     return rpcError(id, -32601, 'method not found: ' + method);
+}
+
+// When the configured port is already bound, find out WHO holds it before reporting:
+// another VS Code window running this extension answers initialize with its own
+// instance block (pid, workspace folders), which is exactly the collision the audit
+// hit when three instances shared 127.0.0.1:9560.
+function describePortSquatter(port, bind, output) {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'vscode-mcp-selfcheck', version: '0' } } });
+    const req = http.request({ host: bind === '0.0.0.0' ? '127.0.0.1' : bind, port, path: '/mcp', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 1500 }, (res) => {
+        let data = '';
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => {
+            try {
+                const reply = JSON.parse(data);
+                const inst = reply && reply.result && reply.result.serverInfo && reply.result.serverInfo.instance;
+                output.appendLine('port ' + port + ' is held by another vscode-mcp instance'
+                    + (inst ? ' pid=' + inst.pid + ' vscode=' + inst.vscode + ' folders=' + JSON.stringify(inst.workspace_folders) : ' (answered initialize but carried no instance block)'));
+            } catch (e) {
+                output.appendLine('port ' + port + ' is already bound by a non-vscode-mcp process');
+            }
+        });
+    });
+    req.on('timeout', () => { req.destroy(); output.appendLine('port ' + port + ' is already bound (probe timed out)'); });
+    req.on('error', () => output.appendLine('port ' + port + ' is already bound'));
+    req.end(body);
 }
 
 function startServer(output) {
@@ -1325,7 +1398,9 @@ function startServer(output) {
     srv.on('error', (e) => {
         output.appendLine('server error: ' + e.message);
         statusItem.text = '$(error) MCP';
-        statusItem.tooltip = 'vscode-mcp: ' + e.message;
+        const detail = e.code === 'EADDRINUSE' ? ' - another process or VS Code window holds this port; close it or set vscodeMcp.port' : '';
+        statusItem.tooltip = 'vscode-mcp: ' + e.message + detail;
+        if (e.code === 'EADDRINUSE') describePortSquatter(port, bind, output);
     });
     srv.listen(port, bind, () => {
         output.appendLine('listening on http://' + bind + ':' + port + '/mcp');
