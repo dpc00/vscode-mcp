@@ -70,19 +70,27 @@ does, once.
 Which primitive to use, in what order - activate, then focus the widget, then type - is the caller's
 procedure and lives in the skill, not here.
 
-**0.9.5: one call per snippet.** A snippet pack is hundreds of happy-path assertions, and the
-missing piece was a primitive, not patience:
+**0.9.5/0.9.6: snippet and completion primitives.** A snippet pack is hundreds of happy-path
+assertions; the missing piece was a primitive, not patience.
 
 - `insert_snippet({name|text, langId, expect?, revert?, include_text?})` inserts into the active
   editor and answers with `matches`/`first_difference` (or text), reverting afterwards when asked -
   one call where `insertSnippet` + `get_text` + `revert` used to be three.
-- `verify_snippets({langId, items:[{name, expect}], revert})` runs such a list in ONE call and
-  returns `{total, pass, fail, results}` with only the failures in detail. It knows nothing about
-  any extension: the caller supplies names and expected text, so a pack of 313 becomes one call
-  instead of a harness written outside the server.
+- `verify_snippets({langId, items:[{name, body}], revert})` runs such a list in ONE call and holds no
+  knowledge of any extension: for each item it inserts the snippet BY NAME and again from its BODY,
+  reads both expansions and compares them, so the assertion is "the registered snippet expands to
+  its own manifest body" with no expansion model on the client. `expect` may replace `body` for a
+  fixed string. Returns `{total, pass, fail, failures}`, failures only in detail (313 snippets =
+  one call, measured 2026-11-15).
+- `complete` takes `kind` ("Snippet", "Function", …) beside `filter`, applied before the limit, so a
+  language whose provider returns thousands of items still lists its snippets in one call.
 
 ## Known gaps (found while building it)
 
+- A client's transport timeout (30 s in the harness this server was built against) kills a `batch`
+  that contains a blocking step - `workbench.action.debug.start`, a modal, a long `wait_for` - and
+  the failure reads as "request timeout, outcome unknown". Blocking commands belong in their own
+  call; after a timeout, read the effect (`list_dialogs`, the file on disk) before retrying.
 - `workbench.extensions.installExtension` opens a "Do you trust the publisher?" dialog that no API can answer, so `install_extension` uses VS Code's own CLI (`out/cli.js`), which does not ask. A new extension shows in `list_extensions` after `workbench.action.reloadWindow`.
 - The extension API cannot read or pick *items* of a quick pick opened by another extension. **Mitigation**: quick picks are drivable via commands (`workbench.action.quickOpen`, `workbench.action.quickOpenSelectNext`/`Previous`, `workbench.action.acceptSelectedQuickOpenItem`, `workbench.action.closeQuickOpen`). See self_test for live example.
 - Cannot take screenshots from inside the extension host (use external tool or computer-use-mcp).
