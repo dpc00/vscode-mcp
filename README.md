@@ -50,11 +50,25 @@ Why `expect` exists: a test phase used to end with `get_text` and the agent read
 
 A local `.vsix` install is NOT faster than the marketplace one when the package is heavy (Live Server: 40 s both ways - its own 3500-file unpack dominates); the argument is for offline or pinned-version installs.
 
-**Fixed in 0.9.2 (three capability holes, not documentation).**
-- `reload_window` is on the default surface and may be the **last** call of a `batch` (it answers before the 0.5 s timer fires, so a batch can end with it). Before this, a client whose only surface was `tools/list` had no way to restart the host, and `run_command workbench.action.reloadWindow` merely answers "Canceled".
-- **`type_keys`** types into widgets no API reaches, through the OS input queue (`user32 SendInput` over the same koffi handle the dialog layer uses): unicode key events for `text` (any layout, any BMP character, `\n` = Enter, `\t` = Tab) and named chords for `keys` (`enter`, `tab`, `escape`, `ctrl+shift+p`, `f1`…). It brings this instance's window forward first - `SetForegroundWindow`, then `SwitchToThisWindow`, then an attached-thread retry, then a synthetic Alt tap, each verified by `GetForegroundWindow` - and defaults to the window that already has the focus. This is what makes a **workbench quick input box** (a project name, a search term) and a **notification toast's secondary action** (`notifications.focusLastToast`, then `tab`, `enter`) drivable. `run_command type` still writes to the editor only.
-- **`run_shell` is back** (it was dropped in 0.7.0): one command through `cmd.exe /d /s /c` (or `/bin/sh -c`), default cwd the first workspace folder, returns `code`, `timed_out`, `ms`, `stdout`, `stderr`.
-- **`click_at` (0.9.3)** clicks a screen position through `SetCursorPos` + `SendInput`, so a pixel target with no accessibility node and no command is reachable from the server: a toast button, a canvas, a custom-drawn control. It needs no foreground window; `window_title` + `relative:true` turn coordinates measured on a screenshot of that window into screen pixels.
+**0.9.4: primitives, no procedures.** Three capability holes were closed by adding tools, and
+the first cut put the caller's procedure inside them. It does not belong there: a tool says what it
+does, once.
+
+- `reload_window` is on the default surface (the host restart a client cannot reach otherwise). It
+  is a plain call; put it last in a batch, because anything after it does not run.
+- `activate_window({title})` brings the first visible window whose title contains `title` forward
+  with one user32 call (`SwitchToThisWindow`, what the taskbar uses) and reports the foreground
+  window afterwards. `ok:false` means nothing moved.
+- `send_keys({text, keys})` sends unicode key events and named chords to whatever has the keyboard
+  focus - it does not touch focus, choose a window, or retry, so the caller must check
+  `activate_window` said ok first.
+- `click_at({x, y, button, count})` moves the pointer and clicks at absolute screen pixels. No
+  window logic.
+- `run_shell({command})` runs one command in the workspace folder and returns `code`,
+  `timed_out`, `ms`, `stdout`, `stderr`.
+
+Which primitive to use, in what order - activate, then focus the widget, then type - is the caller's
+procedure and lives in the skill, not here.
 
 ## Known gaps (found while building it)
 

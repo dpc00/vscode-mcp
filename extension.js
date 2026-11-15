@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.9.3';
+const VERSION = '0.9.4';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -237,31 +237,18 @@ function postMessage(h, msg, wParam) {
     PostMessageW(h, msg, u32(wParam), 0);
 }
 
-// -- OS-level keyboard input (0.9.2) ----------------------------------------------------------
-// The workbench's own quick *input boxes* (as opposed to quick pick lists) are unreachable
-// from the extension API: no command types into them, and `type` writes to the active editor.
-// A notification toast's secondary action is in the same position - only
-// notification.acceptPrimaryAction exists. Both are DOM widgets inside Chromium, which accepts
-// input only when it comes from the system input queue, so the fix is SendInput through the
-// user32 handle koffi already provides. Chromium demands a foreground window for that, hence
-// the SetForegroundWindow + AttachThreadInput dance below.
+// -- OS input primitives (0.9.4) --------------------------------------------------------------
+// Chromium takes input only from the system input queue, so a DOM widget with no API (a quick
+// input box, a toast button) needs SendInput through user32. These are the raw primitives:
+// activate_window, send_keys, click_at. Which one to use, in what order, is a caller decision.
 const GetForegroundWindow = user32 && user32.func('HWND __stdcall GetForegroundWindow()');
 const SetForegroundWindow = user32 && user32.func('bool __stdcall SetForegroundWindow(HWND hWnd)');
-const ShowWindow = user32 && user32.func('bool __stdcall ShowWindow(HWND hWnd, int nCmdShow)');
 const SwitchToThisWindow = user32 && user32.func('void __stdcall SwitchToThisWindow(HWND hWnd, bool fUnknown)');
-const AttachThreadInput = user32 && user32.func('bool __stdcall AttachThreadInput(uint32_t idAttach, uint32_t idAttachTo, bool fAttach)');
 const SendInput = user32 && user32.func('uint32_t __stdcall SendInput(uint32_t cInputs, void *pInputs, int cbSize)');
-let kernel32 = null;
-let GetCurrentThreadId = null;
-try {
-    kernel32 = koffi ? koffi.load('kernel32.dll') : null;
-    GetCurrentThreadId = kernel32 && kernel32.func('uint32_t __stdcall GetCurrentThreadId()');
-} catch (e) { KOFFI_ERROR = KOFFI_ERROR || String((e && e.message) || e).slice(0, 200); }
 
 const KEYEVENTF_KEYUP = 0x0002;
 const KEYEVENTF_UNICODE = 0x0004;
 const SetCursorPos = user32 && user32.func('bool __stdcall SetCursorPos(int x, int y)');
-const GetWindowRect = user32 && user32.func('bool __stdcall GetWindowRect(HWND hWnd, _Out_ int *rect)');
 const MOUSEEVENTF_LEFTDOWN = 0x0002;
 const MOUSEEVENTF_LEFTUP = 0x0004;
 const MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -297,12 +284,6 @@ function mouseRecord(flags) {
     b.writeUInt32LE(0, 0);
     b.writeUInt32LE(flags, 8 + 12);
     return b;
-}
-
-function windowRect(h) {
-    const buf = Buffer.alloc(16);
-    if (!GetWindowRect(h, buf)) return null;
-    return { left: buf.readInt32LE(0), top: buf.readInt32LE(4), right: buf.readInt32LE(8), bottom: buf.readInt32LE(12) };
 }
 
 function vkOf(name) {
@@ -341,51 +322,33 @@ function textRecords(text) {
     return recs;
 }
 
-// The main editor window of this VS Code instance: class Chrome_WidgetWin_1, visible, titled.
-function vscodeWindows() {
-    const out = [];
-    if (!user32) return out;
+// Raw activation: find a top-level window whose title contains `title` and call ONE activation
+// API on it - SwitchToThisWindow, the call the taskbar itself uses, because SetForegroundWindow is
+// routinely refused for a process that does not own the foreground. No chain, no retry: the result
+// reports the foreground window afterwards and the caller decides.
+function activateWindowByTitle(title) {
+    if (!user32) throw new Error('user32 unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
+    const want = String(title).toLowerCase();
+    let found = null;
     let h = u32(GetTopWindow(0));
     while (h) {
-        const pid = [0];
-        if (GetWindowThreadProcessId(h, pid) && DIALOG_PIDS.has(pid[0]) && IsWindowVisible(h)) {
-            const title = windowText(h, 512);
-            if (title && windowClass(h) === 'Chrome_WidgetWin_1') out.push({ hwnd: h, pid: pid[0], title });
+        if (IsWindowVisible(h)) {
+            const t = windowText(h, 512);
+            if (t && t.toLowerCase().includes(want)) { found = { hwnd: h, title: t }; break; }
         }
         h = u32(GetWindow(h, 2));
     }
-    return out;
-}
-
-// Windows only lets a process take the foreground when it is already in the foreground chain
-// or owns the last input event, so a plain SetForegroundWindow from an extension host behind
-// another app is refused (measured 2026-11-14: the Sublime window kept the focus). Three
-// escalating routes, each verified before the next: SwitchToThisWindow (the taskbar's own
-// activation path), an attached-thread SetForegroundWindow, then a synthetic Alt tap - the
-// process that "received input" is allowed to switch - and SetForegroundWindow again.
-function focusWindow(h) {
+    if (!found) throw new Error('no visible window title contains ' + JSON.stringify(title));
     const before = u32(GetForegroundWindow());
-    const before_title = before ? windowText(before, 256) : '';
-    if (before === h) return { ok: true, before, before_title, already: true };
-    try { ShowWindow(h, 9); } catch (e) { /* SW_RESTORE, cosmetic */ }
-    SetForegroundWindow(h);
-    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'SetForegroundWindow' };
-    try { SwitchToThisWindow(h, true); } catch (e) { /* older user32 */ }
-    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'SwitchToThisWindow' };
-    const fg = u32(GetForegroundWindow());
-    const fgPid = [0];
-    const fgThread = fg ? GetWindowThreadProcessId(fg, fgPid) : 0;
-    const me = GetCurrentThreadId && GetCurrentThreadId();
-    if (fgThread && me) AttachThreadInput(me, fgThread, true);
-    SetForegroundWindow(h);
-    if (fgThread && me) AttachThreadInput(me, fgThread, false);
-    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'AttachThreadInput' };
-    try {
-        SendInput(2, Buffer.concat([keyRecord(0x12, 0, 0), keyRecord(0x12, 0, KEYEVENTF_KEYUP)]), 40);
-    } catch (e) { /* the tap is only a hint */ }
-    SetForegroundWindow(h);
-    const now = u32(GetForegroundWindow());
-    return { ok: now === h, before, before_title, now, via: 'alt-tap' };
+    SwitchToThisWindow(found.hwnd, true);
+    const after = u32(GetForegroundWindow());
+    return {
+        hwnd: found.hwnd,
+        title: found.title,
+        ok: after === found.hwnd,
+        foreground_before: before ? windowText(before, 256) : null,
+        foreground_after: after ? windowText(after, 256) : null,
+    };
 }
 
 // A command that opens a modal never returns until someone answers it, and the workbench
@@ -861,13 +824,7 @@ const TOOLS = [
                 const c = calls[i];
                 if (c && typeof c.sleep === 'number') { await new Promise((r) => setTimeout(r, Math.min(c.sleep, 30000))); results.push({ slept: c.sleep }); continue; }
                 const tool = TOOLS.find((t) => t.name === (c && c.tool));
-                if (tool && tool.name === 'reload_window' && i === calls.length - 1) {
-                    // Allowed as the LAST call: it answers before the reload starts, so the batch
-                    // can carry it and end there (0.9.2).
-                    results.push(await tool.run((c && c.arguments) || {}));
-                    continue;
-                }
-                if (!tool || tool.name === 'batch' || tool.name === 'reload_window') { results.push({ error: 'cannot batch tool ' + (c && c.tool) + (tool && tool.name === 'reload_window' ? ' unless it is the last call' : '') }); if (!a.keep_going) break; continue; }
+                if (!tool || tool.name === 'batch') { results.push({ error: 'cannot batch tool ' + (c && c.tool) }); if (!a.keep_going) break; continue; }
                 try { results.push(await tool.run((c && c.arguments) || {})); } catch (e) {
                     results.push({ error: String((e && e.message) || e) });
                     if (!a.keep_going) break;
@@ -911,7 +868,7 @@ const TOOLS = [
     },
     {
         name: 'reload_window',
-        description: 'Reloads the VS Code window (workbench.action.reloadWindow). The call answers first and the reload follows about half a second later, so the server restarts: wait several seconds, then call again. Use it after install_extension so a new extension becomes active. Also accepted as the LAST call of a batch.',
+        description: 'Reloads the VS Code window (workbench.action.reloadWindow). Answers first; the reload follows about half a second later and the server restarts, so the next call has to wait for the new host. Place it last in a batch - anything after it does not run.',
         inputSchema: { type: 'object', properties: {} },
         run: async () => {
             setTimeout(() => { vscode.commands.executeCommand('workbench.action.reloadWindow'); }, 500);
@@ -919,79 +876,60 @@ const TOOLS = [
         },
     },
     {
-        name: 'type_keys',
-        description: 'Types text and/or key chords into the focused window through the OS input queue (user32 SendInput), the only route into workbench widgets no API exposes: quick *input boxes* (a project name, a search term) and a notification toast\'s secondary action. Brings this VS Code window to the foreground first (AttachThreadInput fallback), sends unicode key events for text (so any layout and any BMP character works, \\n = Enter, \\t = Tab) then each chord in keys ("enter", "tab", "escape", "ctrl+shift+p", "alt+f4"). Returns the focus it started from and ended at. Pairs with run_command workbench.action.acceptSelectedQuickOpenItem to submit a quick input.',
+        name: 'send_keys',
+        description: 'Sends keystrokes to whatever window currently has the keyboard focus, through the OS input queue (user32 SendInput). text goes as unicode key events (any layout, \\n = Enter, \\t = Tab); keys is a list of named chords ("enter", "tab", "escape", "ctrl+shift+p", "f1"). Does nothing about focus: activate the window first. Returns how many characters and chords were sent and which window was in front before and after.',
         inputSchema: {
             type: 'object',
             properties: {
                 text: { type: 'string' },
                 keys: { type: ['string', 'array'], items: { type: 'string' } },
-                window_title: { type: 'string' },
-                force: { type: 'boolean' },
                 interval_ms: { type: 'number' },
             },
         },
         run: async (a) => {
             if (!user32 || !SendInput) throw new Error('user32/SendInput unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
-            const wins = vscodeWindows();
-            if (!wins.length) throw new Error('no titled VS Code window of this instance is visible');
-            const want = a.window_title ? String(a.window_title).toLowerCase() : null;
-            // Default target: the window that already has the focus when it belongs to this
-            // instance (that is where the quick input is), else the first one. Two windows are
-            // normal in the audit rig, and typing into the wrong one looks like a no-op.
-            const fgNow = u32(GetForegroundWindow());
-            const target = want
-                ? wins.find((w) => w.title.toLowerCase().includes(want))
-                : (wins.find((w) => w.hwnd === fgNow) || wins[0]);
-            if (!target) throw new Error('no window title contains ' + JSON.stringify(a.window_title) + '; visible: ' + wins.map((w) => w.title).join(' | '));
-            const focus = focusWindow(target.hwnd);
-            const foreground = u32(GetForegroundWindow());
-            if (!focus.ok && !a.force) {
-                return {
-                    ok: false, target: target.title, focus,
-                    foreground_title: foreground ? windowText(foreground, 256) : '',
-                    note: 'the window did not come to the front, so nothing was sent (input would have gone to whatever is in front). Pass force:true to send anyway.',
-                };
-            }
             const keys = Array.isArray(a.keys) ? a.keys : (a.keys ? [String(a.keys)] : []);
             if (!a.text && !keys.length) throw new Error('give text, keys, or both');
             const gap = Math.max(0, Math.min(Number(a.interval_ms) || 0, 1000));
-            let sent_chars = 0;
-            let sent_keys = 0;
+            const before = u32(GetForegroundWindow());
+            let chars = 0;
+            let chords = 0;
             if (a.text) {
                 const recs = textRecords(a.text);
                 const accepted = sendRecords(recs);
-                if (accepted !== recs.length) throw new Error('SendInput accepted ' + accepted + ' of ' + recs.length + ' keyboard records');
-                sent_chars = String(a.text).length;
+                if (accepted !== recs.length) throw new Error('SendInput accepted ' + accepted + ' of ' + recs.length + ' records');
+                chars = String(a.text).length;
                 if (gap) await new Promise((r) => setTimeout(r, gap));
             }
             for (const k of keys) {
-                const recs = chordRecords(k);
-                sendRecords(recs);
-                sent_keys++;
+                sendRecords(chordRecords(k));
+                chords++;
                 if (gap) await new Promise((r) => setTimeout(r, gap));
             }
+            const after = u32(GetForegroundWindow());
             return {
                 ok: true,
-                target: target.title,
-                chars: sent_chars,
-                keys: sent_keys,
-                focus_before: focus.before_title || focus.before || null,
-                focus_after: windowText(u32(GetForegroundWindow()), 256),
-                forced: !focus.ok,
+                chars,
+                chords,
+                foreground_before: before ? windowText(before, 256) : null,
+                foreground_after: after ? windowText(after, 256) : null,
             };
         },
     },
     {
+        name: 'activate_window',
+        description: 'Brings the first visible window whose title contains `title` to the foreground with one user32 activation call (SwitchToThisWindow) and reports the foreground window afterwards. Alone it decides nothing: check ok before sending input anywhere.',
+        inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
+        run: async (a) => activateWindowByTitle(a.title),
+    },
+    {
         name: 'click_at',
-        description: 'Clicks at a screen position with the OS input queue (user32 SetCursorPos + SendInput), which is how a workbench pixel target is reachable when it has no accessibility node and no command: a notification toast\'s secondary action, a canvas, a custom-drawn button. Coordinates are screen pixels by default, or window-relative with window_title + relative:true, so a position read off a screenshot of that window can be used directly. Does not need the window in the foreground (unlike type_keys). Optionally right button or a repeat count.',
+        description: 'Moves the pointer to a screen position and clicks (user32 SetCursorPos + SendInput). No window logic, no focus change: x and y are absolute screen pixels. button is "left" (default) or "right"; count repeats the click.',
         inputSchema: {
             type: 'object',
             properties: {
                 x: { type: 'number' },
                 y: { type: 'number' },
-                window_title: { type: 'string' },
-                relative: { type: 'boolean' },
                 button: { type: 'string' },
                 count: { type: 'number' },
             },
@@ -999,42 +937,18 @@ const TOOLS = [
         },
         run: async (a) => {
             if (!user32 || !SetCursorPos) throw new Error('user32 unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
-            let sx = Math.round(Number(a.x));
-            let sy = Math.round(Number(a.y));
-            let target = null;
-            if (a.window_title) {
-                const want = String(a.window_title).toLowerCase();
-                const wins = vscodeWindows();
-                target = wins.find((w) => w.title.toLowerCase().includes(want));
-                if (!target) throw new Error('no window title contains ' + JSON.stringify(a.window_title) + '; visible: ' + wins.map((w) => w.title).join(' | '));
-            } else if (a.relative) {
-                const fg = u32(GetForegroundWindow());
-                target = vscodeWindows().find((w) => w.hwnd === fg) || vscodeWindows()[0];
-            }
-            if (target && a.relative) {
-                const r = windowRect(target.hwnd);
-                if (!r) throw new Error('GetWindowRect failed for ' + target.title);
-                sx += r.left;
-                sy += r.top;
-            }
+            const sx = Math.round(Number(a.x));
+            const sy = Math.round(Number(a.y));
             const right = String(a.button || 'left').toLowerCase() === 'right';
             const down = right ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
             const up = right ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
             const count = Math.min(Math.max(Number(a.count) || 1, 1), 5);
             if (!SetCursorPos(sx, sy)) throw new Error('SetCursorPos refused ' + sx + ',' + sy);
-            const before = windowText(u32(GetForegroundWindow()), 256);
             for (let i = 0; i < count; i++) {
                 sendRecords([mouseRecord(down), mouseRecord(up)]);
                 if (i + 1 < count) await new Promise((r) => setTimeout(r, 80));
             }
-            await new Promise((r) => setTimeout(r, 150));
-            return {
-                ok: true,
-                clicked: { x: sx, y: sy, button: right ? 'right' : 'left', count },
-                window: target ? target.title : null,
-                foreground_before: before,
-                foreground_after: windowText(u32(GetForegroundWindow()), 256),
-            };
+            return { ok: true, x: sx, y: sy, button: right ? 'right' : 'left', count };
         },
     },
 
@@ -1409,13 +1323,11 @@ const DEFAULT_TOOL_NAMES = [
     'replace_text',
     'save_file',
     'expect',
-    // reload_window is here on purpose (0.9.2): it cannot be batched in the middle of a batch,
-    // and a client whose only surface is tools/list has no other way to restart the host -
-    // the one operation nearly every install/settings test needs.
+    // The host restart, and the two OS input primitives. A client whose only surface is
+    // tools/list has no other way to reach them, and no API covers what they do.
     'reload_window',
-    // Same argument for typing into quick input boxes and toast actions: no API reaches them
-    // and batch cannot type for the client.
-    'type_keys',
+    'activate_window',
+    'send_keys',
     'loop_reset',
 ];
 
