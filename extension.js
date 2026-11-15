@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.9.2';
+const VERSION = '0.9.3';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -260,6 +260,12 @@ try {
 
 const KEYEVENTF_KEYUP = 0x0002;
 const KEYEVENTF_UNICODE = 0x0004;
+const SetCursorPos = user32 && user32.func('bool __stdcall SetCursorPos(int x, int y)');
+const GetWindowRect = user32 && user32.func('bool __stdcall GetWindowRect(HWND hWnd, _Out_ int *rect)');
+const MOUSEEVENTF_LEFTDOWN = 0x0002;
+const MOUSEEVENTF_LEFTUP = 0x0004;
+const MOUSEEVENTF_RIGHTDOWN = 0x0008;
+const MOUSEEVENTF_RIGHTUP = 0x0010;
 const VK = {
     enter: 0x0D, return: 0x0D, tab: 0x09, escape: 0x1B, esc: 0x1B, space: 0x20,
     backspace: 0x08, delete: 0x2E, insert: 0x2D, home: 0x24, end: 0x23,
@@ -283,6 +289,20 @@ function keyRecord(vk, scan, flags) {
 function sendRecords(records) {
     const buf = Buffer.concat(records);
     return SendInput(records.length, buf, 40);
+}
+
+// One mouse INPUT: type=MOUSE(0), then MOUSEINPUT at offset 8 (dx, dy, mouseData, dwFlags).
+function mouseRecord(flags) {
+    const b = Buffer.alloc(40);
+    b.writeUInt32LE(0, 0);
+    b.writeUInt32LE(flags, 8 + 12);
+    return b;
+}
+
+function windowRect(h) {
+    const buf = Buffer.alloc(16);
+    if (!GetWindowRect(h, buf)) return null;
+    return { left: buf.readInt32LE(0), top: buf.readInt32LE(4), right: buf.readInt32LE(8), bottom: buf.readInt32LE(12) };
 }
 
 function vkOf(name) {
@@ -962,6 +982,62 @@ const TOOLS = [
             };
         },
     },
+    {
+        name: 'click_at',
+        description: 'Clicks at a screen position with the OS input queue (user32 SetCursorPos + SendInput), which is how a workbench pixel target is reachable when it has no accessibility node and no command: a notification toast\'s secondary action, a canvas, a custom-drawn button. Coordinates are screen pixels by default, or window-relative with window_title + relative:true, so a position read off a screenshot of that window can be used directly. Does not need the window in the foreground (unlike type_keys). Optionally right button or a repeat count.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x: { type: 'number' },
+                y: { type: 'number' },
+                window_title: { type: 'string' },
+                relative: { type: 'boolean' },
+                button: { type: 'string' },
+                count: { type: 'number' },
+            },
+            required: ['x', 'y'],
+        },
+        run: async (a) => {
+            if (!user32 || !SetCursorPos) throw new Error('user32 unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
+            let sx = Math.round(Number(a.x));
+            let sy = Math.round(Number(a.y));
+            let target = null;
+            if (a.window_title) {
+                const want = String(a.window_title).toLowerCase();
+                const wins = vscodeWindows();
+                target = wins.find((w) => w.title.toLowerCase().includes(want));
+                if (!target) throw new Error('no window title contains ' + JSON.stringify(a.window_title) + '; visible: ' + wins.map((w) => w.title).join(' | '));
+            } else if (a.relative) {
+                const fg = u32(GetForegroundWindow());
+                target = vscodeWindows().find((w) => w.hwnd === fg) || vscodeWindows()[0];
+            }
+            if (target && a.relative) {
+                const r = windowRect(target.hwnd);
+                if (!r) throw new Error('GetWindowRect failed for ' + target.title);
+                sx += r.left;
+                sy += r.top;
+            }
+            const right = String(a.button || 'left').toLowerCase() === 'right';
+            const down = right ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
+            const up = right ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
+            const count = Math.min(Math.max(Number(a.count) || 1, 1), 5);
+            if (!SetCursorPos(sx, sy)) throw new Error('SetCursorPos refused ' + sx + ',' + sy);
+            const before = windowText(u32(GetForegroundWindow()), 256);
+            for (let i = 0; i < count; i++) {
+                sendRecords([mouseRecord(down), mouseRecord(up)]);
+                if (i + 1 < count) await new Promise((r) => setTimeout(r, 80));
+            }
+            await new Promise((r) => setTimeout(r, 150));
+            return {
+                ok: true,
+                clicked: { x: sx, y: sy, button: right ? 'right' : 'left', count },
+                window: target ? target.title : null,
+                foreground_before: before,
+                foreground_after: windowText(u32(GetForegroundWindow()), 256),
+            };
+        },
+    },
+
     {
         name: 'run_shell',
         description: 'Runs one shell command (cmd.exe /d /s /c on Windows, /bin/sh -c elsewhere) in the workspace folder and returns exit code, stdout and stderr in the same call: the way to read a program\'s effects (files it wrote, exit codes, a server it started) without opening a terminal or a second shell. Pipelines and redirects work because it is a real shell; timeout default 60 s, output capped at 20000 characters.',
