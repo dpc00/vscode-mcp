@@ -48,6 +48,55 @@ function describeUri(uri) {
     return uri.scheme === 'file' ? uri.fsPath : uri.toString();
 }
 
+// A notebook is a document, not a text tab: openNotebookDocument goes straight to the
+// notebook serializer (vscode.open resolves an .ipynb to the text editor on this build even
+// with vscode.ipynb active), then showNotebookDocument puts it in an editor so cells can run.
+async function notebookDocument(p) {
+    const uri = fileUri(p);
+    const find = () => vscode.workspace.notebookDocuments.find((d) => d.uri.toString() === uri.toString());
+    let doc = find();
+    if (doc) return doc;
+    let openError = null;
+    try {
+        doc = await vscode.workspace.openNotebookDocument(uri);
+    } catch (e) {
+        openError = e && e.message ? e.message : String(e);
+        doc = null;
+    }
+    if (!doc) {
+        await vscode.commands.executeCommand('vscode.open', uri, { preview: false });
+        for (let i = 0; i < 50 && !doc; i++) { await new Promise((r) => setTimeout(r, 100)); doc = find(); }
+    }
+    if (!doc) throw new Error('no notebook document for ' + p + (openError ? ' (' + openError + ')' : '') + ' - no notebook serializer claims it; check that the notebook extension (ms-toolsai.jupyter) is installed and enabled');
+    return doc;
+}
+
+async function showNotebook(doc) {
+    const active = vscode.window.activeNotebookEditor;
+    if (active && active.notebook.uri.toString() === doc.uri.toString()) return active;
+    try {
+        return await vscode.window.showNotebookDocument(doc, { preview: false });
+    } catch (e) {
+        return null;
+    }
+}
+
+// NotebookCellOutput items carry mime data; text/plain is the human-readable one and is what a
+// test can assert on. Binary mime types are named, not dumped.
+function cellOutputs(cell) {
+    const out = [];
+    for (const o of cell.outputs || []) {
+        for (const item of o.items || []) {
+            if (item.mime === 'text/plain' || item.mime === 'application/vnd.code.notebook.stdout' || item.mime === 'application/vnd.code.notebook.stderr' || item.mime === 'application/vnd.code.notebook.error' || item.mime === 'text/html') {
+                out.push({ mime: item.mime, text: cap(Buffer.from(item.data).toString('utf8'), 2000) });
+            } else {
+                out.push({ mime: item.mime, bytes: item.data ? item.data.length : 0 });
+            }
+        }
+    }
+    return out;
+}
+
 // Which VS Code window this server lives in. tabGroups.all covers only THIS window's
 // groups, and viewColumn repeats across windows, so a window is identified by its SET of
 // view columns; windows are numbered by the lowest column each owns, sorted. Tabs carry
@@ -533,7 +582,11 @@ const TOOLS = [
         description: 'Runs a VS Code command by id with optional arguments, like choosing it from the command palette. Returns the command result (JSON, capped) or an error. Arguments that need VS Code objects are written as {"$uri": "c:\\\\a.txt"}, {"$pos": [line, character]} and {"$range": [l1, c1, l2, c2]}, e.g. vscode.executeHoverProvider with [{"$uri": "..."}, {"$pos": [0, 5]}].',
         inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array' } }, required: ['command'] },
         run: async (a) => {
-            const result = await dispatchCommand(a.command, (a.args || []).map(reviveArg));
+            // A single argument is common (workbench.action.quickOpen "file"), and JSON callers
+            // send it as a string: wrap it instead of failing on .map (2026-11-15: "(a.args || []).map
+            // is not a function" made every one-argument command look unsupported).
+            const rawArgs = a.args === undefined || a.args === null ? [] : (Array.isArray(a.args) ? a.args : [a.args]);
+            const result = await dispatchCommand(a.command, rawArgs.map(reviveArg));
             if (result && typeof result === 'object' && result.pending) return result;
             if (result === undefined) return { ok: true, result: null };
             // Provider commands (completions, hover, symbols) return large objects: cap what goes back.
@@ -586,17 +639,112 @@ const TOOLS = [
     },
     {
         name: 'open_file',
-        description: 'Opens a file in an editor tab (optionally at a 0-based line), without taking over an existing preview tab.',
+        description: 'Opens a file the way a click does (vscode.open, so workbench.editorAssociations and files.associations apply - a .ipynb becomes a Notebook Editor) and reports which editor came up. Falls back to the text editor only if the resource has no other editor. Optionally places the cursor at a 0-based line.',
         inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' } }, required: ['path'] },
         run: async (a) => {
-            const doc = await vscode.workspace.openTextDocument(fileUri(a.path));
+            const uri = fileUri(a.path);
+            // showTextDocument always forces the text editor, which is why a notebook used to
+            // arrive as JSON (2026-11-15). vscode.open goes through the same resolution as a
+            // double-click, so the association decides.
+            await vscode.commands.executeCommand('vscode.open', uri, { preview: false });
+            for (let i = 0; i < 30; i++) {
+                const activeNb = vscode.window.activeNotebookEditor;
+                if (activeNb && activeNb.notebook.uri.toString() === uri.toString()) {
+                    return { ok: true, path: describeUri(uri), editor: 'notebook', cells: activeNb.notebook.cellCount };
+                }
+                const activeText = vscode.window.activeTextEditor;
+                if (activeText && activeText.document.uri.toString() === uri.toString()) break;
+                await sleep(100);
+            }
+            const doc = await vscode.workspace.openTextDocument(uri);
             const ed = await vscode.window.showTextDocument(doc, { preview: false });
             if (a.line !== undefined) {
                 const p = posOf(doc, a.line, a.character || 0);
                 ed.selection = new vscode.Selection(p, p);
                 ed.revealRange(new vscode.Range(p, p));
             }
-            return { ok: true, path: describeUri(doc.uri) };
+            return { ok: true, path: describeUri(uri), editor: 'text' };
+        },
+    },
+    {
+        name: 'notebook_open',
+        description: 'Opens a notebook file in the Notebook Editor (never the text editor) and waits for the document, returning the cell count. Throws when the file resolves to no notebook type, which is the signal that the editor association is missing.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+        run: async (a) => {
+            const doc = await notebookDocument(a.path);
+            return { ok: true, path: describeUri(doc.uri), editor: 'notebook', cells: doc.cellCount };
+        },
+    },
+    {
+        name: 'notebook_cells',
+        description: 'Lists the cells of a notebook: index, kind, language, source (capped) and the execution summary after a run.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, max: { type: 'number' }, outputs: { type: 'boolean' } }, required: ['path'] },
+        run: async (a) => {
+            const doc = await notebookDocument(a.path);
+            return doc.getCells().map((c, i) => ({
+                index: i,
+                kind: c.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown',
+                language: c.document.languageId,
+                source: cap(c.document.getText(), a.max || 400),
+                order: c.executionSummary ? c.executionSummary.executionOrder : null,
+                success: c.executionSummary ? c.executionSummary.success : null,
+                outputs: a.outputs ? cellOutputs(c) : undefined,
+            }));
+        },
+    },
+    {
+        name: 'notebook_set_cell',
+        description: 'Replaces the source of one cell (0-based index) and saves the notebook: the way to put code into a notebook, since a cell is not a text editor tab.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, index: { type: 'number' }, source: { type: 'string' } }, required: ['path', 'index', 'source'] },
+        run: async (a) => {
+            const doc = await notebookDocument(a.path);
+            const cells = doc.getCells();
+            const i = Number(a.index);
+            if (!(i >= 0 && i < cells.length)) throw new Error('index out of range: ' + i + ' of ' + cells.length);
+            const edit = new vscode.WorkspaceEdit();
+            edit.set(doc.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(i, i + 1), [new vscode.NotebookCellData(cells[i].kind, String(a.source), cells[i].document.languageId)])]);
+            const ok = await vscode.workspace.applyEdit(edit);
+            await doc.save();
+            return { ok, index: i, cells: doc.cellCount };
+        },
+    },
+    {
+        name: 'notebook_execute',
+        description: 'Runs cells of a notebook and waits for the run to settle (all cells when indices is omitted), returning per-cell execution order, success and captured text output. The kernel comes from whichever editor extension provides it (ms-python.python for Python).',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, indices: { type: 'array' }, timeout_ms: { type: 'number' } }, required: ['path'] },
+        run: async (a) => {
+            const doc = await notebookDocument(a.path);
+            let editor = vscode.window.activeNotebookEditor;
+            if (!editor || editor.notebook.uri.toString() !== doc.uri.toString()) {
+                editor = await showNotebook(doc);
+                await sleep(300);
+            }
+            const indices = Array.isArray(a.indices) && a.indices.length ? a.indices.map(Number) : doc.getCells().map((c, i) => i);
+            const perCellMs = a.timeout_ms || 30000;
+            const results = [];
+            // One cell per command: a single execute with several ranges runs them in PARALLEL
+            // (both got execution order 1 on 2026-11-15, so cell 2 saw no state from cell 1).
+            // Awaiting each cell reproduces what Run All does and keeps the notebook's own
+            // ordering guarantee.
+            for (const i of indices) {
+                const before = doc.getCells()[i];
+                const beforeOrder = before && before.executionSummary ? before.executionSummary.executionOrder : 0;
+                if (editor) editor.selection = new vscode.NotebookRange(i, i + 1);
+                await vscode.commands.executeCommand('notebook.cell.execute', { ranges: [new vscode.NotebookRange(i, i + 1)], document: doc.uri });
+                const deadline = Date.now() + perCellMs;
+                let cells = doc.getCells();
+                const ran = () => cells[i] && cells[i].executionSummary && cells[i].executionSummary.executionOrder > beforeOrder;
+                while (!ran() && Date.now() < deadline) { await sleep(150); cells = doc.getCells(); }
+                const cell = cells[i];
+                results.push({
+                    index: i,
+                    order: cell && cell.executionSummary ? cell.executionSummary.executionOrder : null,
+                    success: cell && cell.executionSummary ? cell.executionSummary.success : null,
+                    outputs: cell ? cellOutputs(cell) : null,
+                });
+            }
+            await doc.save();
+            return { ok: true, ran: indices.length, settled: results.every((r) => r.order !== null), cells: results };
         },
     },
     {
@@ -1266,7 +1414,7 @@ const TOOLS = [
     {
         name: 'dismiss_dialog',
         description: 'Closes a native dialog of this VS Code instance, cancel-first: clicks the button matching cancel_re (default /cancel|no|don.t save|close|discard/i) when one is visible, otherwise posts WM_COMMAND IDCANCEL (the dialog\'s own cancel press), then WM_CLOSE (on Task Dialogs WM_CLOSE IS cancel). Verifies the close by re-enumerating and reports dismissed/still_up, so no second list_dialogs call is needed. hwnd defaults to the first dialog from list_dialogs. Workbench quick picks and input boxes are not native dialogs - they are unreachable.',
-        inputSchema: { type: 'object', properties: { hwnd: { type: 'number' }, cancel_re: { type: 'string' } } },
+        inputSchema: { type: 'object', properties: { hwnd: { type: 'number' }, cancel_re: { type: 'string' }, button: { type: 'string', description: 'Label or /regex/ of the button to press instead of cancelling. When given, no cancel fallback is used: an unknown label is an error listing the buttons, so a confirmation dialog is never answered by accident.' } } },
         run: async (a) => {
             const enumOut = enumDialogs();
             if (enumOut.error) return { ok: false, error: enumOut.error };
@@ -1292,6 +1440,27 @@ const TOOLS = [
             const cancel = (dlg.buttons || []).find((b) => re.test(b.text || ''));
             const WM_COMMAND_IDCANCEL = 0x0111, IDCANCEL = 2, WM_CLOSE = 0x0010, BM_CLICK = 0x00F5;
             let via;
+            if (a.button) {
+                // An explicit button replaces the whole cancel ladder: a caller that names
+                // "Install" or "Save" means it, and answering with Cancel instead is a silent
+                // wrong action (2026-11-15: the ipykernel prompt's Install could not be pressed).
+                const label = String(a.button);
+                // Win32 labels carry an ampersand before the mnemonic ("Do&n't Save") and use
+                // typographic apostrophes; neither is part of what the caller means. Compare on
+                // letters and digits only, and keep the /regex/ form for anything unusual.
+                const flat = (s) => String(s || '').replace(/&/g, '').replace(/[^A-Za-z0-9]+/g, '').toLowerCase();
+                const exact = /^\/.*\/[a-z]*$/i.test(label) ? new RegExp(label.slice(1, label.lastIndexOf('/')), label.slice(label.lastIndexOf('/') + 1) || 'i') : null;
+                const hit = exact
+                    ? (dlg.buttons || []).find((b) => exact.test(String(b.text || '')))
+                    : (dlg.buttons || []).find((b) => flat(b.text) === flat(label));
+                const loose = hit || (dlg.buttons || []).find((b) => flat(b.text).includes(flat(label)));
+                if (!loose) return { ok: false, error: 'no button matching ' + label, buttons: (dlg.buttons || []).map((b) => b.text), hwnd: dlg.hwnd };
+                postMessage(loose.hwnd, BM_CLICK);
+                await sleep(200);
+                const afterNamed = enumDialogs().dialogs;
+                const stillNamed = afterNamed.some((d) => d.hwnd === dlg.hwnd);
+                return { ok: !stillNamed, via: 'button: ' + loose.text, hwnd: dlg.hwnd, dismissed: !stillNamed, still_up: stillNamed, note: stillNamed ? 'dialog is still up - the button may open another dialog' : undefined };
+            }
             if (cancel) {
                 postMessage(cancel.hwnd, BM_CLICK);
                 via = 'button: ' + cancel.text;
@@ -1412,6 +1581,10 @@ const DEFAULT_TOOL_NAMES = [
     'get_active_file',
     'get_text',
     'open_file',
+    'notebook_open',
+    'notebook_cells',
+    'notebook_set_cell',
+    'notebook_execute',
     'create_file',
     'replace_text',
     'save_file',
