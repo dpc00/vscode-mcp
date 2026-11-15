@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.9.1';
+const VERSION = '0.9.2';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -235,6 +235,137 @@ function enumDialogs() {
 
 function postMessage(h, msg, wParam) {
     PostMessageW(h, msg, u32(wParam), 0);
+}
+
+// -- OS-level keyboard input (0.9.2) ----------------------------------------------------------
+// The workbench's own quick *input boxes* (as opposed to quick pick lists) are unreachable
+// from the extension API: no command types into them, and `type` writes to the active editor.
+// A notification toast's secondary action is in the same position - only
+// notification.acceptPrimaryAction exists. Both are DOM widgets inside Chromium, which accepts
+// input only when it comes from the system input queue, so the fix is SendInput through the
+// user32 handle koffi already provides. Chromium demands a foreground window for that, hence
+// the SetForegroundWindow + AttachThreadInput dance below.
+const GetForegroundWindow = user32 && user32.func('HWND __stdcall GetForegroundWindow()');
+const SetForegroundWindow = user32 && user32.func('bool __stdcall SetForegroundWindow(HWND hWnd)');
+const ShowWindow = user32 && user32.func('bool __stdcall ShowWindow(HWND hWnd, int nCmdShow)');
+const SwitchToThisWindow = user32 && user32.func('void __stdcall SwitchToThisWindow(HWND hWnd, bool fUnknown)');
+const AttachThreadInput = user32 && user32.func('bool __stdcall AttachThreadInput(uint32_t idAttach, uint32_t idAttachTo, bool fAttach)');
+const SendInput = user32 && user32.func('uint32_t __stdcall SendInput(uint32_t cInputs, void *pInputs, int cbSize)');
+let kernel32 = null;
+let GetCurrentThreadId = null;
+try {
+    kernel32 = koffi ? koffi.load('kernel32.dll') : null;
+    GetCurrentThreadId = kernel32 && kernel32.func('uint32_t __stdcall GetCurrentThreadId()');
+} catch (e) { KOFFI_ERROR = KOFFI_ERROR || String((e && e.message) || e).slice(0, 200); }
+
+const KEYEVENTF_KEYUP = 0x0002;
+const KEYEVENTF_UNICODE = 0x0004;
+const VK = {
+    enter: 0x0D, return: 0x0D, tab: 0x09, escape: 0x1B, esc: 0x1B, space: 0x20,
+    backspace: 0x08, delete: 0x2E, insert: 0x2D, home: 0x24, end: 0x23,
+    pageup: 0x21, pagedown: 0x22, up: 0x26, down: 0x28, left: 0x25, right: 0x27,
+    ctrl: 0x11, control: 0x11, shift: 0x10, alt: 0x12, win: 0x5B,
+    f1: 0x70, f2: 0x71, f3: 0x72, f4: 0x73, f5: 0x74, f6: 0x75,
+    f7: 0x76, f8: 0x77, f9: 0x78, f10: 0x79, f11: 0x7A, f12: 0x7B,
+};
+
+// One INPUT record: type=KEYBOARD(1) then the KEYBDINPUT union member at offset 8. The union is
+// 32 bytes on x64 (MOUSEINPUT is the widest member), so the record is 40 bytes.
+function keyRecord(vk, scan, flags) {
+    const b = Buffer.alloc(40);
+    b.writeUInt32LE(1, 0);
+    b.writeUInt16LE(vk, 8);
+    b.writeUInt16LE(scan, 10);
+    b.writeUInt32LE(flags, 12);
+    return b;
+}
+
+function sendRecords(records) {
+    const buf = Buffer.concat(records);
+    return SendInput(records.length, buf, 40);
+}
+
+function vkOf(name) {
+    const k = String(name).toLowerCase();
+    if (VK[k] !== undefined) return VK[k];
+    if (/^[a-z]$/.test(k)) return k.toUpperCase().charCodeAt(0);
+    if (/^[0-9]$/.test(k)) return k.charCodeAt(0);
+    throw new Error('unknown key name: ' + name);
+}
+
+// "ctrl+shift+p" -> modifiers down, key down/up, modifiers up. "enter" -> one key.
+function chordRecords(chord) {
+    const parts = String(chord).split('+').map((p) => p.trim()).filter(Boolean);
+    if (!parts.length) return [];
+    const key = parts.pop();
+    const mods = parts.map(vkOf);
+    const recs = [];
+    for (const m of mods) recs.push(keyRecord(m, 0, 0));
+    const vk = vkOf(key);
+    recs.push(keyRecord(vk, 0, 0), keyRecord(vk, 0, KEYEVENTF_KEYUP));
+    for (const m of mods.slice().reverse()) recs.push(keyRecord(m, 0, KEYEVENTF_KEYUP));
+    return recs;
+}
+
+// Typed text: every character goes as a unicode key event, which is what makes arbitrary text
+// (paths, names, non-ASCII) reach a DOM input regardless of the keyboard layout.
+function textRecords(text) {
+    const recs = [];
+    for (const ch of String(text)) {
+        if (ch === '\n') { recs.push(...chordRecords('enter')); continue; }
+        if (ch === '\t') { recs.push(...chordRecords('tab')); continue; }
+        const code = ch.codePointAt(0);
+        if (code > 0xFFFF) throw new Error('character outside the BMP cannot be sent as one key event: ' + ch);
+        recs.push(keyRecord(0, code, KEYEVENTF_UNICODE), keyRecord(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+    }
+    return recs;
+}
+
+// The main editor window of this VS Code instance: class Chrome_WidgetWin_1, visible, titled.
+function vscodeWindows() {
+    const out = [];
+    if (!user32) return out;
+    let h = u32(GetTopWindow(0));
+    while (h) {
+        const pid = [0];
+        if (GetWindowThreadProcessId(h, pid) && DIALOG_PIDS.has(pid[0]) && IsWindowVisible(h)) {
+            const title = windowText(h, 512);
+            if (title && windowClass(h) === 'Chrome_WidgetWin_1') out.push({ hwnd: h, pid: pid[0], title });
+        }
+        h = u32(GetWindow(h, 2));
+    }
+    return out;
+}
+
+// Windows only lets a process take the foreground when it is already in the foreground chain
+// or owns the last input event, so a plain SetForegroundWindow from an extension host behind
+// another app is refused (measured 2026-11-14: the Sublime window kept the focus). Three
+// escalating routes, each verified before the next: SwitchToThisWindow (the taskbar's own
+// activation path), an attached-thread SetForegroundWindow, then a synthetic Alt tap - the
+// process that "received input" is allowed to switch - and SetForegroundWindow again.
+function focusWindow(h) {
+    const before = u32(GetForegroundWindow());
+    const before_title = before ? windowText(before, 256) : '';
+    if (before === h) return { ok: true, before, before_title, already: true };
+    try { ShowWindow(h, 9); } catch (e) { /* SW_RESTORE, cosmetic */ }
+    SetForegroundWindow(h);
+    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'SetForegroundWindow' };
+    try { SwitchToThisWindow(h, true); } catch (e) { /* older user32 */ }
+    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'SwitchToThisWindow' };
+    const fg = u32(GetForegroundWindow());
+    const fgPid = [0];
+    const fgThread = fg ? GetWindowThreadProcessId(fg, fgPid) : 0;
+    const me = GetCurrentThreadId && GetCurrentThreadId();
+    if (fgThread && me) AttachThreadInput(me, fgThread, true);
+    SetForegroundWindow(h);
+    if (fgThread && me) AttachThreadInput(me, fgThread, false);
+    if (u32(GetForegroundWindow()) === h) return { ok: true, before, before_title, via: 'AttachThreadInput' };
+    try {
+        SendInput(2, Buffer.concat([keyRecord(0x12, 0, 0), keyRecord(0x12, 0, KEYEVENTF_KEYUP)]), 40);
+    } catch (e) { /* the tap is only a hint */ }
+    SetForegroundWindow(h);
+    const now = u32(GetForegroundWindow());
+    return { ok: now === h, before, before_title, now, via: 'alt-tap' };
 }
 
 // A command that opens a modal never returns until someone answers it, and the workbench
@@ -705,10 +836,18 @@ const TOOLS = [
         inputSchema: { type: 'object', properties: { calls: { type: 'array', items: { type: 'object' } }, keep_going: { type: 'boolean' } }, required: ['calls'] },
         run: async (a) => {
             const results = [];
-            for (const c of a.calls || []) {
+            const calls = a.calls || [];
+            for (let i = 0; i < calls.length; i++) {
+                const c = calls[i];
                 if (c && typeof c.sleep === 'number') { await new Promise((r) => setTimeout(r, Math.min(c.sleep, 30000))); results.push({ slept: c.sleep }); continue; }
                 const tool = TOOLS.find((t) => t.name === (c && c.tool));
-                if (!tool || tool.name === 'batch' || tool.name === 'reload_window') { results.push({ error: 'cannot batch tool ' + (c && c.tool) }); if (!a.keep_going) break; continue; }
+                if (tool && tool.name === 'reload_window' && i === calls.length - 1) {
+                    // Allowed as the LAST call: it answers before the reload starts, so the batch
+                    // can carry it and end there (0.9.2).
+                    results.push(await tool.run((c && c.arguments) || {}));
+                    continue;
+                }
+                if (!tool || tool.name === 'batch' || tool.name === 'reload_window') { results.push({ error: 'cannot batch tool ' + (c && c.tool) + (tool && tool.name === 'reload_window' ? ' unless it is the last call' : '') }); if (!a.keep_going) break; continue; }
                 try { results.push(await tool.run((c && c.arguments) || {})); } catch (e) {
                     results.push({ error: String((e && e.message) || e) });
                     if (!a.keep_going) break;
@@ -752,12 +891,107 @@ const TOOLS = [
     },
     {
         name: 'reload_window',
-        description: 'Reloads the VS Code window (workbench.action.reloadWindow). The call answers first and the reload follows about half a second later, so the server restarts: wait several seconds, then call again. Use it after install_extension so a new extension becomes active.',
+        description: 'Reloads the VS Code window (workbench.action.reloadWindow). The call answers first and the reload follows about half a second later, so the server restarts: wait several seconds, then call again. Use it after install_extension so a new extension becomes active. Also accepted as the LAST call of a batch.',
         inputSchema: { type: 'object', properties: {} },
         run: async () => {
             setTimeout(() => { vscode.commands.executeCommand('workbench.action.reloadWindow'); }, 500);
             return { ok: true, note: 'reloading in about 0.5 s; reconnect after a few seconds' };
         },
+    },
+    {
+        name: 'type_keys',
+        description: 'Types text and/or key chords into the focused window through the OS input queue (user32 SendInput), the only route into workbench widgets no API exposes: quick *input boxes* (a project name, a search term) and a notification toast\'s secondary action. Brings this VS Code window to the foreground first (AttachThreadInput fallback), sends unicode key events for text (so any layout and any BMP character works, \\n = Enter, \\t = Tab) then each chord in keys ("enter", "tab", "escape", "ctrl+shift+p", "alt+f4"). Returns the focus it started from and ended at. Pairs with run_command workbench.action.acceptSelectedQuickOpenItem to submit a quick input.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                text: { type: 'string' },
+                keys: { type: ['string', 'array'], items: { type: 'string' } },
+                window_title: { type: 'string' },
+                force: { type: 'boolean' },
+                interval_ms: { type: 'number' },
+            },
+        },
+        run: async (a) => {
+            if (!user32 || !SendInput) throw new Error('user32/SendInput unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
+            const wins = vscodeWindows();
+            if (!wins.length) throw new Error('no titled VS Code window of this instance is visible');
+            const want = a.window_title ? String(a.window_title).toLowerCase() : null;
+            // Default target: the window that already has the focus when it belongs to this
+            // instance (that is where the quick input is), else the first one. Two windows are
+            // normal in the audit rig, and typing into the wrong one looks like a no-op.
+            const fgNow = u32(GetForegroundWindow());
+            const target = want
+                ? wins.find((w) => w.title.toLowerCase().includes(want))
+                : (wins.find((w) => w.hwnd === fgNow) || wins[0]);
+            if (!target) throw new Error('no window title contains ' + JSON.stringify(a.window_title) + '; visible: ' + wins.map((w) => w.title).join(' | '));
+            const focus = focusWindow(target.hwnd);
+            const foreground = u32(GetForegroundWindow());
+            if (!focus.ok && !a.force) {
+                return {
+                    ok: false, target: target.title, focus,
+                    foreground_title: foreground ? windowText(foreground, 256) : '',
+                    note: 'the window did not come to the front, so nothing was sent (input would have gone to whatever is in front). Pass force:true to send anyway.',
+                };
+            }
+            const keys = Array.isArray(a.keys) ? a.keys : (a.keys ? [String(a.keys)] : []);
+            if (!a.text && !keys.length) throw new Error('give text, keys, or both');
+            const gap = Math.max(0, Math.min(Number(a.interval_ms) || 0, 1000));
+            let sent_chars = 0;
+            let sent_keys = 0;
+            if (a.text) {
+                const recs = textRecords(a.text);
+                const accepted = sendRecords(recs);
+                if (accepted !== recs.length) throw new Error('SendInput accepted ' + accepted + ' of ' + recs.length + ' keyboard records');
+                sent_chars = String(a.text).length;
+                if (gap) await new Promise((r) => setTimeout(r, gap));
+            }
+            for (const k of keys) {
+                const recs = chordRecords(k);
+                sendRecords(recs);
+                sent_keys++;
+                if (gap) await new Promise((r) => setTimeout(r, gap));
+            }
+            return {
+                ok: true,
+                target: target.title,
+                chars: sent_chars,
+                keys: sent_keys,
+                focus_before: focus.before_title || focus.before || null,
+                focus_after: windowText(u32(GetForegroundWindow()), 256),
+                forced: !focus.ok,
+            };
+        },
+    },
+    {
+        name: 'run_shell',
+        description: 'Runs one shell command (cmd.exe /d /s /c on Windows, /bin/sh -c elsewhere) in the workspace folder and returns exit code, stdout and stderr in the same call: the way to read a program\'s effects (files it wrote, exit codes, a server it started) without opening a terminal or a second shell. Pipelines and redirects work because it is a real shell; timeout default 60 s, output capped at 20000 characters.',
+        inputSchema: {
+            type: 'object',
+            properties: { command: { type: 'string' }, cwd: { type: 'string' }, timeout_ms: { type: 'number' } },
+            required: ['command'],
+        },
+        run: (a) => new Promise((resolve) => {
+            const root = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+            const cwd = a.cwd ? path.resolve(String(a.cwd)) : (root ? root.uri.fsPath : process.cwd());
+            const timeout = Math.min(Math.max(Number(a.timeout_ms) || 60000, 1000), 600000);
+            const win = process.platform === 'win32';
+            const exe = win ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
+            const args = win ? ['/d', '/s', '/c', String(a.command)] : ['-c', String(a.command)];
+            const t0 = Date.now();
+            execFile(exe, args, { cwd, timeout, maxBuffer: 8 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+                const code = err && typeof err.code === 'number' ? err.code : (err ? null : 0);
+                resolve({
+                    ok: !err,
+                    code,
+                    timed_out: !!(err && (err.killed || err.signal)),
+                    ms: Date.now() - t0,
+                    cwd,
+                    stdout: cap(String(stdout || '')),
+                    stderr: cap(String(stderr || '')),
+                    error: err && typeof err.code !== 'number' ? String(err.message || err).slice(0, 400) : undefined,
+                });
+            });
+        }),
     },
     {
         name: 'close_file',
@@ -1099,6 +1333,13 @@ const DEFAULT_TOOL_NAMES = [
     'replace_text',
     'save_file',
     'expect',
+    // reload_window is here on purpose (0.9.2): it cannot be batched in the middle of a batch,
+    // and a client whose only surface is tools/list has no other way to restart the host -
+    // the one operation nearly every install/settings test needs.
+    'reload_window',
+    // Same argument for typing into quick input boxes and toast actions: no API reaches them
+    // and batch cannot type for the client.
+    'type_keys',
     'loop_reset',
 ];
 
