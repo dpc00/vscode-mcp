@@ -9,7 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const os = require('os');
 
-const VERSION = '0.9.4';
+const VERSION = '0.9.6';
 const STARTED_AT = Date.now();
 const MAX_TEXT = 20000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -653,8 +653,8 @@ const TOOLS = [
     },
     {
         name: 'complete',
-        description: 'Completions at a position (path, 0-based line and character), without the 20000-character cap of run_command: returns total, then at most limit (default 50) items as label, description, kind, detail, insert. filter is a case-insensitive regular expression on the label, applied before the limit. trigger is an optional trigger character.',
-        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' }, filter: { type: 'string' }, limit: { type: 'number' }, trigger: { type: 'string' } }, required: ['path'] },
+        description: 'Completions at a position (path, 0-based line and character), without the 20000-character cap of run_command: returns total, then at most limit (default 50) items as label, description, kind, detail, insert. filter is a case-insensitive regular expression on the label and kind is a CompletionItemKind filter (e.g. "Snippet"), both applied before the limit - so a snippet pack can be listed in one call even where the provider offers thousands of other items. trigger is an optional trigger character.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, character: { type: 'number' }, filter: { type: 'string' }, kind: { type: 'string' }, limit: { type: 'number' }, trigger: { type: 'string' } }, required: ['path'] },
         run: async (a) => {
             const uri = fileUri(a.path);
             await vscode.workspace.openTextDocument(uri);
@@ -666,6 +666,7 @@ const TOOLS = [
                 return { label: obj ? obj.label : i.label, description: obj ? obj.description : undefined, kind: vscode.CompletionItemKind[i.kind], detail: i.detail, insert: ins };
             });
             if (re) items = items.filter((i) => re.test(i.label));
+            if (a.kind) { const k = String(a.kind).toLowerCase(); items = items.filter((i) => String(i.kind || '').toLowerCase() === k); }
             return { total: items.length, items: items.slice(0, a.limit || 50) };
         },
     },
@@ -691,6 +692,98 @@ const TOOLS = [
             await vscode.workspace.openTextDocument(uri);
             const found = (await vscode.commands.executeCommand('vscode.executeDefinitionProvider', uri, new vscode.Position(a.line || 0, a.character || 0))) || [];
             return found.map((l) => { const u = l.uri || l.targetUri; const r = l.range || l.targetSelectionRange || l.targetRange; return { path: describeUri(u), line: r.start.line, character: r.start.character }; });
+        },
+    },
+    {
+        name: 'insert_snippet',
+        description: 'Inserts a snippet the way editor.action.insertSnippet does - by name with langId, or literal text - into the active editor, then answers with the result: matches/first_difference when expect is given, else chars (and text with include_text). revert:true reverts the document afterwards so the next insert starts from the file on disk. One call per snippet instead of insert + get_text + revert.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                name: { type: 'string' },
+                text: { type: 'string' },
+                langId: { type: 'string' },
+                expect: { type: 'string' },
+                revert: { type: 'boolean' },
+                include_text: { type: 'boolean' },
+            },
+        },
+        run: async (a) => {
+            if (!a.name && a.text === undefined) throw new Error('give name or text');
+            if (!vscode.window.activeTextEditor) throw new Error('no active editor');
+            const arg = a.text !== undefined ? { snippet: a.text } : (a.langId ? { name: a.name, langId: a.langId } : { name: a.name });
+            const before = vscode.window.activeTextEditor.document.getText();
+            await vscode.commands.executeCommand('editor.action.insertSnippet', arg);
+            const doc = vscode.window.activeTextEditor.document;
+            const got = doc.getText();
+            const norm = (x) => String(x).replace(/\r\n/g, '\n');
+            const out = { ok: true, chars: got.length, changed: got !== before };
+            if (a.expect !== undefined) {
+                if (norm(got) === norm(a.expect)) out.matches = true;
+                else {
+                    out.matches = false;
+                    const e = norm(a.expect).split('\n'), g = norm(got).split('\n');
+                    let i = 0;
+                    while (i < e.length && i < g.length && e[i] === g[i]) i++;
+                    out.first_difference = { line: i, expected: e[i], actual: g[i] };
+                }
+            }
+            if (a.include_text) out.text = cap(got);
+            if (a.revert) await vscode.commands.executeCommand('workbench.action.files.revert');
+            return out;
+        },
+    },
+    {
+        name: 'verify_snippets',
+        description: 'Runs a list of snippet assertions in ONE call, generically. For each item it inserts the snippet twice into the active editor - once BY NAME (the registered snippet) and once from its BODY text - reads both results and compares them, so the check is "does the registered snippet expand to its manifest body", with no expansion model on the client side. expect may be given instead of body for a fixed string. Reverts between steps when revert is true (default). Returns total/pass/fail and the failures in detail.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                langId: { type: 'string' },
+                items: { type: 'array', items: { type: 'object' } },
+                revert: { type: 'boolean' },
+                stop_on_failure: { type: 'boolean' },
+                max_failures: { type: 'number' },
+            },
+            required: ['items'],
+        },
+        run: async (a) => {
+            if (!vscode.window.activeTextEditor) throw new Error('no active editor');
+            const norm = (x) => String(x).replace(/\r\n/g, '\n');
+            const read = async (arg) => {
+                await vscode.commands.executeCommand('editor.action.insertSnippet', arg);
+                const t = vscode.window.activeTextEditor.document.getText();
+                if (a.revert !== false) await vscode.commands.executeCommand('workbench.action.files.revert');
+                return t;
+            };
+            const results = [];
+            let pass = 0, fail = 0;
+            const maxFail = Math.max(1, Number(a.max_failures) || 20);
+            for (let i = 0; i < a.items.length; i++) {
+                const it = a.items[i] || {};
+                const label = it.name !== undefined ? it.name : ('#' + i);
+                try {
+                    const byName = await read(a.langId ? { name: it.name, langId: a.langId } : { name: it.name });
+                    let wanted;
+                    if (it.body !== undefined) {
+                        const body = Array.isArray(it.body) ? it.body.join('\n') : String(it.body);
+                        wanted = await read({ snippet: body });
+                    } else if (it.expect !== undefined) {
+                        wanted = it.expect;
+                    } else { throw new Error('item needs body or expect'); }
+                    if (norm(byName) === norm(wanted)) { pass++; continue; }
+                    fail++;
+                    const e = norm(wanted).split('\n'), g = norm(byName).split('\n');
+                    let k = 0;
+                    while (k < e.length && k < g.length && e[k] === g[k]) k++;
+                    if (results.length < maxFail) results.push({ index: i, name: label, first_difference: { line: k, manifest: e[k], registered: g[k] } });
+                } catch (e) {
+                    fail++;
+                    if (results.length < maxFail) results.push({ index: i, name: label, error: String((e && e.message) || e).slice(0, 200) });
+                }
+                if (fail && a.stop_on_failure) break;
+            }
+            return { total: a.items.length, pass, fail, failures: results };
         },
     },
     {

@@ -70,6 +70,17 @@ does, once.
 Which primitive to use, in what order - activate, then focus the widget, then type - is the caller's
 procedure and lives in the skill, not here.
 
+**0.9.5: one call per snippet.** A snippet pack is hundreds of happy-path assertions, and the
+missing piece was a primitive, not patience:
+
+- `insert_snippet({name|text, langId, expect?, revert?, include_text?})` inserts into the active
+  editor and answers with `matches`/`first_difference` (or text), reverting afterwards when asked -
+  one call where `insertSnippet` + `get_text` + `revert` used to be three.
+- `verify_snippets({langId, items:[{name, expect}], revert})` runs such a list in ONE call and
+  returns `{total, pass, fail, results}` with only the failures in detail. It knows nothing about
+  any extension: the caller supplies names and expected text, so a pack of 313 becomes one call
+  instead of a harness written outside the server.
+
 ## Known gaps (found while building it)
 
 - `workbench.extensions.installExtension` opens a "Do you trust the publisher?" dialog that no API can answer, so `install_extension` uses VS Code's own CLI (`out/cli.js`), which does not ask. A new extension shows in `list_extensions` after `workbench.action.reloadWindow`.
