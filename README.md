@@ -59,9 +59,15 @@ does, once.
 - `activate_window({title})` brings the first visible window whose title contains `title` forward
   with one user32 call (`SwitchToThisWindow`, what the taskbar uses) and reports the foreground
   window afterwards. `ok:false` means nothing moved.
-- `send_keys({text, keys})` sends unicode key events and named chords to whatever has the keyboard
-  focus - it does not touch focus, choose a window, or retry, so the caller must check
-  `activate_window` said ok first.
+- `send_keys({text, keys, window})` sends unicode key events and named chords to whatever has the
+  keyboard focus - it does not touch focus, choose a window, or retry, so the caller must check
+  `activate_window` said ok first. Pass `window` (a title substring) and it fails closed instead:
+  the foreground window is re-read immediately before every record batch and the call throws
+  `refused: foreground window is "…"` without sending anything else, so a focus steal cannot type
+  into the person's own terminal. `keys` understands mouse-free punctuation as well
+  (`ctrl+shift+-`, `[`, `]`, `\\`, `;`, `'`, `,`, `.`, `/`, `` ` ``) through the `VK_OEM_*` codes.
+  A modifier is sent 40 ms before its key and released 30 ms after it, so a chord like `shift+b`
+  arrives with the modifier actually down.
 - `click_at({x, y, button, count})` moves the pointer and clicks at absolute screen pixels. No
   window logic.
 - `run_shell({command})` runs one command in the workspace folder and returns `code`,

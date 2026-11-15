@@ -309,6 +309,12 @@ const VK = {
     ctrl: 0x11, control: 0x11, shift: 0x10, alt: 0x12, win: 0x5B,
     f1: 0x70, f2: 0x71, f3: 0x72, f4: 0x73, f5: 0x74, f6: 0x75,
     f7: 0x76, f8: 0x77, f9: 0x78, f10: 0x79, f11: 0x7A, f12: 0x7B,
+    // Punctuation, as the VK_OEM_* codes: a chord like "ctrl+shift+-" is a real binding in
+    // extensions (Jupyter Keymap's split-cell) and used to throw "unknown key name: -".
+    '-': 0xBD, '=': 0xBB, plus: 0xBB, '[': 0xDB, ']': 0xDD, '\\': 0xDC, ';': 0xBA,
+    "'": 0xDE, ',': 0xBC, '.': 0xBE, '/': 0xBF, '`': 0xC0,
+    minus: 0xBD, equal: 0xBB, semicolon: 0xBA, quote: 0xDE, comma: 0xBC, period: 0xBE,
+    slash: 0xBF, backslash: 0xDC, backquote: 0xC0,
 };
 
 // One INPUT record: type=KEYBOARD(1) then the KEYBDINPUT union member at offset 8. The union is
@@ -1118,24 +1124,39 @@ const TOOLS = [
     },
     {
         name: 'send_keys',
-        description: 'Sends keystrokes to whatever window currently has the keyboard focus, through the OS input queue (user32 SendInput). text goes as unicode key events (any layout, \\n = Enter, \\t = Tab); keys is a list of named chords ("enter", "tab", "escape", "ctrl+shift+p", "f1"). Does nothing about focus: activate the window first. Returns how many characters and chords were sent and which window was in front before and after.',
+        description: 'Sends keystrokes to whatever window currently has the keyboard focus, through the OS input queue (user32 SendInput). text goes as unicode key events (any layout, \\n = Enter, \\t = Tab); keys is a list of named chords ("enter", "tab", "escape", "ctrl+shift+p", "f1"). Pass window (a title substring) to make it fail closed: the foreground window is re-read immediately before every keystroke and the call throws, sending nothing further, when a focus steal put another window in front. Without window it types wherever focus is - only for a window you just activated and own.',
         inputSchema: {
             type: 'object',
             properties: {
                 text: { type: 'string' },
                 keys: { type: ['string', 'array'], items: { type: 'string' } },
                 interval_ms: { type: 'number' },
+                window: { type: 'string', description: 'Title substring the foreground window must match before every keystroke; a mismatch throws instead of typing elsewhere.' },
             },
         },
         run: async (a) => {
             if (!user32 || !SendInput) throw new Error('user32/SendInput unavailable: ' + (KOFFI_ERROR || 'koffi not loaded'));
             const keys = Array.isArray(a.keys) ? a.keys : (a.keys ? [String(a.keys)] : []);
             if (!a.text && !keys.length) throw new Error('give text, keys, or both');
+            const want = a.window ? String(a.window).toLowerCase() : null;
+            // The guard: Chromium routes OS input to the foreground window, so a focus steal between
+            // activate_window and the keys types into whatever the person brought forward. Re-read the
+            // foreground before EVERY record batch and throw before sending anything else (2026-11-15:
+            // "JDD" and "j" landed in the user's own terminal when this was checked only afterwards).
+            const guard = () => {
+                if (!want) return;
+                const h = u32(GetForegroundWindow());
+                const title = h ? windowText(h, 256) : null;
+                if (!title || !title.toLowerCase().includes(want)) {
+                    throw new Error('refused: foreground window is "' + (title || '(none)') + '", not matching "' + a.window + '" - nothing was sent');
+                }
+            };
             const gap = Math.max(0, Math.min(Number(a.interval_ms) || 0, 1000));
             const before = u32(GetForegroundWindow());
             let chars = 0;
             let chords = 0;
             if (a.text) {
+                guard();
                 const recs = textRecords(a.text);
                 const accepted = sendRecords(recs);
                 if (accepted !== recs.length) throw new Error('SendInput accepted ' + accepted + ' of ' + recs.length + ' records');
@@ -1143,7 +1164,24 @@ const TOOLS = [
                 if (gap) await new Promise((r) => setTimeout(r, gap));
             }
             for (const k of keys) {
-                sendRecords(chordRecords(k));
+                guard();
+                // A modifier and its letter in ONE SendInput batch arrives with the modifier still
+                // unseen, so Chromium dispatches the keydown with shiftKey=false and an uppercase
+                // binding ("B", "J", "D D") never matches - measured 2026-11-15 on Jupyter Keymap:
+                // j/k/l fired, shift+j/shift+b/shift+d did not, shift+enter (a named key) did.
+                // Send the modifier state, let the input queue drain, then the key.
+                const parts = String(k).split('+').map((p) => p.trim()).filter(Boolean);
+                const keyName = parts.pop();
+                const modVks = parts.map(vkOf);
+                for (const m of modVks) { guard(); sendRecords([keyRecord(m, 0, 0)]); }
+                if (modVks.length) await new Promise((r) => setTimeout(r, 40));
+                guard();
+                sendRecords(chordRecords(keyName));
+                if (modVks.length) {
+                    await new Promise((r) => setTimeout(r, 30));
+                    guard();
+                    for (const m of modVks.slice().reverse()) sendRecords([keyRecord(m, 0, KEYEVENTF_KEYUP)]);
+                }
                 chords++;
                 if (gap) await new Promise((r) => setTimeout(r, gap));
             }
