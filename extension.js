@@ -572,6 +572,54 @@ const TOOLS = [
         },
     },
     {
+        name: 'lm_tools',
+        description: 'Lists the language-model tools contributed in this window, straight from vscode.lm.tools: name, tags and description, optionally filtered by a substring of the name. Read-only, and the lister for lm_tool. Every extension that contributes languageModelTools in its package.json appears here, which is how those tools can be tested without an AI client in the window.',
+        inputSchema: { type: 'object', properties: { filter: { type: 'string', description: 'case-insensitive substring of the tool name' }, limit: { type: 'number' } } },
+        run: async (a) => {
+            const lm = vscode.lm;
+            if (!lm || !Array.isArray(lm.tools)) throw new Error('vscode.lm.tools is unavailable in this build');
+            const f = a && a.filter ? String(a.filter).toLowerCase() : '';
+            const all = lm.tools.filter((t) => !f || String(t.name).toLowerCase().includes(f));
+            return {
+                count: all.length,
+                tools: all.slice(0, (a && a.limit) || 100).map((t) => ({
+                    name: t.name,
+                    tags: Array.from(t.tags || []),
+                    description: t.description || '',
+                })),
+            };
+        },
+    },
+    {
+        name: 'lm_tool',
+        description: 'Invokes one language-model tool by name through vscode.lm.invokeTool and returns its content parts as text. This is the only way to exercise a tool an extension contributes as a languageModelTool when the window has no AI client: no chat participant is needed, and the call is the same one a model would make. A consent prompt may appear on the first call - answer it with list_dialogs and dismiss_dialog. Pair with lm_tools to see what exists.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                name: { type: 'string', description: 'exact tool name from lm_tools' },
+                input: { type: 'object', description: 'the tool input object; omit for tools that take none' },
+            },
+            required: ['name'],
+        },
+        run: async (a) => {
+            const lm = vscode.lm;
+            if (!lm || typeof lm.invokeTool !== 'function') throw new Error('vscode.lm.invokeTool is unavailable in this build');
+            const cts = new vscode.CancellationTokenSource();
+            try {
+                const res = await lm.invokeTool(a.name, { input: a.input || {} }, cts.token);
+                const parts = Array.isArray(res && res.content) ? res.content : [];
+                const text = parts.map((p) => {
+                    if (p && typeof p.value === 'string') return p.value;
+                    if (p && p.value != null) return JSON.stringify(p.value);
+                    return JSON.stringify(p);
+                }).join('\n');
+                return { name: a.name, parts: parts.length, text };
+            } finally {
+                cts.dispose();
+            }
+        },
+    },
+    {
         name: 'list_commands',
         description: 'Lists VS Code command ids, optionally filtered by a substring. Without a filter only the count is returned (there are thousands).',
         inputSchema: { type: 'object', properties: { filter: { type: 'string' }, limit: { type: 'number' } } },
