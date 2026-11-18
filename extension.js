@@ -35,10 +35,6 @@ function registryDir() {
     return path.join(os.tmpdir(), 'vscode-mcp-instances');
 }
 
-function pidAlive(pid) {
-    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
-}
-
 // One FILE per instance, in one directory. Two writers sharing one file lost each other's entries:
 // each read-modify-write dropped whatever the other had written between the read and the write, and
 // that is how the Windows and the WSL instance kept deleting each other.
@@ -69,7 +65,8 @@ function removeSelf() {
 
 const HOST_NAME = os.hostname();
 const ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
-const INSTANCE_ID = HOST_NAME + '-' + process.pid + '-' + Date.now().toString(36);
+const PLATFORM = process.platform;
+const INSTANCE_ID = PLATFORM + '-' + HOST_NAME + '-' + process.pid + '-' + Date.now().toString(36);
 
 // The registry is a list of announcements, not a source of truth about liveness: WSL2 hands the
 // guest the Windows hostname, so "same host" cannot be inferred and kill(pid, 0) would prune the
@@ -88,6 +85,7 @@ function selfEntry() {
         id: INSTANCE_ID,
         pid: process.pid,
         host: HOST_NAME,
+        platform: PLATFORM,
         port: boundPort,
         vscode: vscode.version,
         folders: (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath),
