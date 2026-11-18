@@ -1023,6 +1023,39 @@ const TOOLS = [
         },
     },
     {
+        name: 'set_selection',
+        description: 'Puts the cursor in a file at a 0-based line and character, or selects a range with end_line/end_character, and makes that editor the active one. Commands that act on the selection or the cursor - Go: Add Tags, Generate Interface Stubs, Test Function At Cursor, format selection - need this: nothing else in the surface can move the cursor.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                path: { type: 'string' },
+                line: { type: 'number' },
+                character: { type: 'number' },
+                end_line: { type: 'number', description: 'omit for a collapsed cursor' },
+                end_character: { type: 'number' },
+                reveal: { type: 'boolean', description: 'default true; scroll the position into view' },
+            },
+            required: ['path', 'line'],
+        },
+        run: async (a) => {
+            const doc = await vscode.workspace.openTextDocument(fileUri(a.path));
+            const start = posOf(doc, a.line, a.character || 0);
+            if (a.end_line === undefined) {
+                const sel = new vscode.Selection(start, start);
+                const ed = await vscode.window.showTextDocument(doc, { preview: false, selection: sel });
+                ed.selection = sel;
+                if (a.reveal !== false) ed.revealRange(new vscode.Range(start, start), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                return { ok: true, path: a.path, line: start.line, character: start.character, selection: [ed.selection.start.line, ed.selection.start.character, ed.selection.end.line, ed.selection.end.character] };
+            }
+            const end = posOf(doc, a.end_line, a.end_character || 0);
+            const sel = new vscode.Selection(start, end);
+            const ed = await vscode.window.showTextDocument(doc, { preview: false, selection: sel });
+            ed.selection = sel;
+            if (a.reveal !== false) ed.revealRange(new vscode.Range(start, end), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            return { ok: true, path: a.path, line: start.line, character: start.character, selection: [ed.selection.start.line, ed.selection.start.character, ed.selection.end.line, ed.selection.end.character] };
+        },
+    },
+    {
         name: 'discover',
         description: 'Finds tools. Give query (case-insensitive regular expression over name, VS Code command id and description) to search the whole catalogue - including the thousands of generated command tools, one per VS Code command - or category to browse it (omit both for the top-level map). Each hit carries its inputSchema, so the next call is right the first time. Run a hit through batch, even for one call: batch({"calls":[{"tool":"<name>","arguments":{...}}]}). This is how a thousand-tool surface stays usable in a small context: never scroll a list, search it.',
         inputSchema: {
