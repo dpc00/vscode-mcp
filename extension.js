@@ -48,6 +48,27 @@ function describeUri(uri) {
     return uri.scheme === 'file' ? uri.fsPath : uri.toString();
 }
 
+// The workbench's own breakpoint store, flattened to JSON. The adapter's verification of each
+// breakpoint is a DAP answer (setBreakpoints), not a property here.
+function breakpointList() {
+    return vscode.debug.breakpoints.map((b) => {
+        const base = { enabled: b.enabled !== false };
+        if (b.condition) base.condition = b.condition;
+        if (b.hitCondition) base.hitCondition = b.hitCondition;
+        if (b.logMessage) base.logMessage = b.logMessage;
+        if (b.location) {
+            base.path = describeUri(b.location.uri);
+            base.line = b.location.range.start.line;
+            base.character = b.location.range.start.character;
+            base.kind = 'source';
+        } else {
+            base.kind = 'function';
+            if (b.functionName) base.functionName = b.functionName;
+        }
+        return base;
+    });
+}
+
 // A notebook is a document, not a text tab: openNotebookDocument goes straight to the
 // notebook serializer (vscode.open resolves an .ipynb to the text editor on this build even
 // with vscode.ipynb active), then showNotebookDocument puts it in an editor so cells can run.
@@ -1642,6 +1663,85 @@ const TOOLS = [
         description: 'Clears the loop guard\'s failure streaks so a tool that kept failing can be tried again after the situation changed (an extension finished installing, a dialog was answered, a reload happened). Without a tool name every streak is cleared. The guard itself is not a failure: it fires only after the same call fails identically LOOP_BREAK_AFTER times inside 15 minutes, and the loop_breaker result names loop_reset as the way through.',
         inputSchema: { type: 'object', properties: { tool: { type: 'string', description: 'clear only this tool\'s streaks' } } },
         run: async (a) => ({ ok: true, cleared: guardClear(a && a.tool) }),
+    },
+
+    // -- debugging ---------------------------------------------------------------------------
+    // A debugger is otherwise untestable through the API: breakpoints live in the workbench and
+    // the stack, scopes and variables live behind DAP, and everything else is a tree view. These
+    // five tools reach all of it without focus, keystrokes or captures.
+    {
+        name: 'debug_state',
+        description: 'The active debug session (id, type, name) and, with details, its threads and the top stack frames - read through DAP customRequest, so no Variables or Call Stack view is involved. Without a session it says so and reports how many breakpoints are held.',
+        inputSchema: { type: 'object', properties: { details: { type: 'boolean', description: 'also ask the adapter for threads and stack frames' }, thread: { type: 'number', description: 'threadId to read the stack of (default: the first thread)' }, levels: { type: 'number', description: 'stack frames to ask for (default 20)' } } },
+        run: async (a) => {
+            const s = vscode.debug.activeDebugSession;
+            const bps = breakpointList();
+            if (!s) return { active: false, breakpoints: bps };
+            const out = { active: true, id: s.id, type: s.type, name: s.name, breakpoints: bps };
+            if (!a.details) return out;
+            try {
+                const threads = await s.customRequest('threads');
+                out.threads = (threads && threads.threads) || [];
+                const id = a.thread != null ? a.thread : (out.threads[0] && out.threads[0].id);
+                if (id != null) {
+                    const stack = await s.customRequest('stackTrace', { threadId: id, startFrame: 0, levels: a.levels || 20 });
+                    out.stack = (stack && stack.stackFrames || []).map((f) => ({ id: f.id, name: f.name, line: f.line, path: f.source && f.source.path }));
+                }
+            } catch (e) {
+                out.error = String((e && e.message) || e);
+            }
+            return out;
+        },
+    },
+    {
+        name: 'debug_request',
+        description: 'Sends one DAP request to the active debug session and returns the adapter\'s answer: continue, next, stepIn, stepOut, pause, stackTrace, scopes, variables, evaluate, setVariable, setBreakpoints, exceptionInfo, ... This is how a debugger is driven and read: it is the same channel the Debug view uses, with no UI.',
+        inputSchema: { type: 'object', properties: { request: { type: 'string', description: 'the DAP request name, e.g. "next" or "variables"' }, args: { type: 'object', description: 'the request arguments, e.g. {"threadId":1} or {"threadId":1,"frameId":2}' } }, required: ['request'] },
+        run: async (a) => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s) throw new Error('no active debug session');
+            const r = await s.customRequest(String(a.request), a.args || {});
+            return r === undefined ? { ok: true, request: a.request } : r;
+        },
+    },
+    {
+        name: 'breakpoints',
+        description: 'Lists the breakpoints the workbench holds: path and line (0-based) for source breakpoints, plus enabled, condition, hitCondition and logMessage. Verified/unverified state is the adapter\'s answer to setBreakpoints, asked separately or read from debug_request.',
+        inputSchema: { type: 'object', properties: {} },
+        run: async () => breakpointList(),
+    },
+    {
+        name: 'set_breakpoints',
+        description: 'Creates source breakpoints through vscode.debug.addBreakpoints - no editor focus, no keypress. items: [{path, line (0-based), enabled?, condition?, hitCondition?, logMessage?}]. An existing breakpoint at the same path and line is replaced, so the same call is idempotent. Returns the resulting list.',
+        inputSchema: { type: 'object', properties: { items: { type: 'array', description: 'breakpoints to create', items: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, enabled: { type: 'boolean' }, condition: { type: 'string' }, hitCondition: { type: 'string' }, logMessage: { type: 'string' } }, required: ['path', 'line'] } } }, required: ['items'] },
+        run: async (a) => {
+            if (!a.items || !a.items.length) throw new Error('give items');
+            const made = [];
+            for (const it of a.items) {
+                const uri = fileUri(String(it.path));
+                const line = Math.max(0, parseInt(it.line, 10) || 0);
+                const stale = vscode.debug.breakpoints.filter((b) => b.location && b.location.uri.toString() === uri.toString() && b.location.range.start.line === line);
+                if (stale.length) vscode.debug.removeBreakpoints(stale);
+                made.push(new vscode.SourceBreakpoint(new vscode.Location(uri, new vscode.Position(line, 0)), it.enabled !== false, it.condition, it.hitCondition, it.logMessage));
+            }
+            vscode.debug.addBreakpoints(made);
+            return { ok: true, added: made.length, breakpoints: breakpointList() };
+        },
+    },
+    {
+        name: 'clear_breakpoints',
+        description: 'Removes every breakpoint, or only the source breakpoints in one path. Returns what is left.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'remove only breakpoints in this file' } } },
+        run: async (a) => {
+            const all = vscode.debug.breakpoints;
+            let gone = all;
+            if (a.path) {
+                const want = fileUri(String(a.path)).toString();
+                gone = all.filter((b) => b.location && b.location.uri.toString() === want);
+            }
+            if (gone.length) vscode.debug.removeBreakpoints(gone);
+            return { ok: true, removed: gone.length, breakpoints: breakpointList() };
+        },
     },
 ];
 
