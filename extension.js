@@ -1917,6 +1917,25 @@ const TOOLS = [
     },
 ];
 
+// Every tool accepts the cross-window selector that handleRpc acts on, so it must be DECLARED in
+// the schema: a client validates arguments against the schema and drops what is not declared (the
+// first version of the forwarding looked broken - {"window": 9561} was silently stripped and the
+// call ran locally, answering with this instance's pid).
+const WINDOW_PROP = {
+    type: ['string', 'number'],
+    description: 'run this call in another VS Code window: its port, "pid:<n>", a workspace-folder substring, or host:port. instances lists them. Omit to run it here.',
+};
+
+function declareWindowParam(tools) {
+    for (const t of tools) {
+        if (!t.inputSchema) t.inputSchema = { type: 'object', properties: {} };
+        if (!t.inputSchema.properties) t.inputSchema.properties = {};
+        if (!t.inputSchema.properties.window) t.inputSchema.properties.window = WINDOW_PROP;
+    }
+}
+
+declareWindowParam(TOOLS);
+
 // -- the default tool surface ----------------------------------------------------------------
 // tools/list answers with this list and nothing else. Every other tool - the rest of the
 // hand-written ones and every generated VS Code command tool (thousands of them) - stays
@@ -2366,6 +2385,7 @@ function activate(context) {
     server = startServer(output);
     buildCommandTools().then((gen) => {
         TOOLS.push(...gen);
+        declareWindowParam(gen);
         for (const t of TOOLS) guarded(t);
         output.appendLine('generated ' + gen.length + ' command tools; ' + TOOLS.length + ' tools in all');
     }, (e) => output.appendLine('command tool generation failed: ' + String((e && e.message) || e)));
