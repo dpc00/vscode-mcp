@@ -57,6 +57,11 @@
           "type": "boolean",
           "default": true,
           "description": "When the configured port is already bound by another window, take the next free port instead of failing (9561, 9562, ...). Off keeps the port pinned, which is what a client that mounts one fixed port wants."
+        },
+        "vscodeMcp.registryDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory holding one <instance>.json per window (default: vscode-mcp-instances inside this host's temp folder). Point a remote window at the SAME directory - e.g. /mnt/c/Users/<you>/AppData/Local/Temp/vscode-mcp-instances - so the local and the remote side list each other."
         }
       }
     }

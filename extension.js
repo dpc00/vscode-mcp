@@ -24,32 +24,70 @@ let boundPort = null; // the port this instance actually holds (configured, or t
 // reachable if the mounted instance knows where it is. Each instance therefore publishes itself in
 // this registry, and any tool call may name another window with {"window": <port|"pid:N"|folder>};
 // the request is then forwarded over the loopback to that instance and its answer relayed back.
-const REGISTRY_FILE = path.join(os.tmpdir(), 'vscode-mcp-instances.json');
+const REGISTRY_FILE_DEFAULT = path.join(os.tmpdir(), 'vscode-mcp-instances.json');
+
+// A remote extension host has its own /tmp, so two instances on one machine do not see each other's
+// registry. vscodeMcp.registryFile points both at one file - a remote window can write the Windows
+// temp through /mnt/c, and then the mounted instance lists it and can forward to it.
+function registryDir() {
+    const configured = vscode.workspace.getConfiguration('vscodeMcp').get('registryDir', '');
+    if (configured) return String(configured);
+    return path.join(os.tmpdir(), 'vscode-mcp-instances');
+}
 
 function pidAlive(pid) {
     try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+// One FILE per instance, in one directory. Two writers sharing one file lost each other's entries:
+// each read-modify-write dropped whatever the other had written between the read and the write, and
+// that is how the Windows and the WSL instance kept deleting each other.
 function readRegistry() {
-    try {
-        const list = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
-        return Array.isArray(list) ? list.filter(e => e && e.pid && e.port) : [];
-    } catch (e) { return []; }
+    const dir = registryDir();
+    let names;
+    try { names = fs.readdirSync(dir); } catch (e) { return []; }
+    const out = [];
+    for (const name of names) {
+        if (!name.endsWith('.json')) continue;
+        try {
+            const entry = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+            if (entry && entry.id && entry.port) out.push(entry);
+        } catch (e) { /* a half-written or foreign file: skip it */ }
+    }
+    return out;
 }
 
-function writeRegistry(entries) {
-    try { fs.writeFileSync(REGISTRY_FILE, JSON.stringify(entries, null, 1)); } catch (e) { /* the registry is a convenience, never a requirement */ }
+function writeSelf(entry) {
+    const dir = registryDir();
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* exists */ }
+    try { fs.writeFileSync(path.join(dir, entry.id + '.json'), JSON.stringify(entry, null, 1)); } catch (e) { /* the registry is a convenience, never a requirement */ }
 }
 
+function removeSelf() {
+    try { fs.unlinkSync(path.join(registryDir(), INSTANCE_ID + '.json')); } catch (e) { /* already gone */ }
+}
+
+const HOST_NAME = os.hostname();
+const ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
+const INSTANCE_ID = HOST_NAME + '-' + process.pid + '-' + Date.now().toString(36);
+
+// The registry is a list of announcements, not a source of truth about liveness: WSL2 hands the
+// guest the Windows hostname, so "same host" cannot be inferred and kill(pid, 0) would prune the
+// other side's live entry (it did - each instance deleted the other). Entries age out after a day;
+// `instances` decides who is actually alive by probing the port.
 function liveEntries() {
-    const live = readRegistry().filter(e => pidAlive(e.pid));
-    writeRegistry(live);
-    return live;
+    return readRegistry().filter(e => Date.now() - (e.started_at || 0) < ENTRY_TTL_MS);
+}
+
+function upsertSelfEntry() {
+    writeSelf(selfEntry());
 }
 
 function selfEntry() {
     return {
+        id: INSTANCE_ID,
         pid: process.pid,
+        host: HOST_NAME,
         port: boundPort,
         vscode: vscode.version,
         folders: (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath),
@@ -60,15 +98,11 @@ function selfEntry() {
 
 function registerSelf() {
     if (!boundPort) return;
-    const rest = liveEntries().filter(e => e.pid !== process.pid);
-    const mine = selfEntry();
-    delete mine.self;
-    rest.push(mine);
-    writeRegistry(rest);
+    upsertSelfEntry();
 }
 
 function unregisterSelf() {
-    writeRegistry(liveEntries().filter(e => e.pid !== process.pid));
+    removeSelf();
 }
 
 // Resolve a window specification against this instance and the registry. Numbers are a port first
@@ -1815,7 +1849,7 @@ const TOOLS = [
                 self: mine,
                 others,
                 count: 1 + others.length,
-                registry_file: REGISTRY_FILE,
+                registry_dir: registryDir(),
                 usage: '{"window": <port | "pid:<n>" | folder substring>} on any tool call, including inside batch',
             };
         },
