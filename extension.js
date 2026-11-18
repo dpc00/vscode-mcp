@@ -17,6 +17,120 @@ const MAX_BODY = 4 * 1024 * 1024;
 let server = null;
 let statusItem = null;
 let logDir = null; // this window's extension host log folder (parent of this extension's own log folder)
+let boundPort = null; // the port this instance actually holds (configured, or the next free one)
+
+// Every window runs its own extension host and its own server. One client (the harness) mounts one
+// of them, so a sibling window - a second window, or a remote one whose host runs in WSL - is only
+// reachable if the mounted instance knows where it is. Each instance therefore publishes itself in
+// this registry, and any tool call may name another window with {"window": <port|"pid:N"|folder>};
+// the request is then forwarded over the loopback to that instance and its answer relayed back.
+const REGISTRY_FILE = path.join(os.tmpdir(), 'vscode-mcp-instances.json');
+
+function pidAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function readRegistry() {
+    try {
+        const list = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
+        return Array.isArray(list) ? list.filter(e => e && e.pid && e.port) : [];
+    } catch (e) { return []; }
+}
+
+function writeRegistry(entries) {
+    try { fs.writeFileSync(REGISTRY_FILE, JSON.stringify(entries, null, 1)); } catch (e) { /* the registry is a convenience, never a requirement */ }
+}
+
+function liveEntries() {
+    const live = readRegistry().filter(e => pidAlive(e.pid));
+    writeRegistry(live);
+    return live;
+}
+
+function selfEntry() {
+    return {
+        pid: process.pid,
+        port: boundPort,
+        vscode: vscode.version,
+        folders: (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath),
+        started_at: STARTED_AT,
+        self: true,
+    };
+}
+
+function registerSelf() {
+    if (!boundPort) return;
+    const rest = liveEntries().filter(e => e.pid !== process.pid);
+    const mine = selfEntry();
+    delete mine.self;
+    rest.push(mine);
+    writeRegistry(rest);
+}
+
+function unregisterSelf() {
+    writeRegistry(liveEntries().filter(e => e.pid !== process.pid));
+}
+
+// Resolve a window specification against this instance and the registry. Numbers are a port first
+// and a pid second (ports are what a user sees in the status bar); "pid:N" is explicit; anything
+// else is matched against the workspace folders, case-insensitively.
+function instanceFor(spec) {
+    const s = String(spec == null ? '' : spec).trim();
+    if (!s || s === 'self') return selfEntry();
+    const entries = [selfEntry(), ...liveEntries().filter(e => e.pid !== process.pid).map(e => ({ ...e, self: false }))];
+    const byPid = (pid) => entries.find(e => e.pid === Number(pid)) || null;
+    const byPort = (port) => entries.find(e => e.port === Number(port)) || null;
+    let m = /^pid:(\d+)$/i.exec(s);
+    if (m) return byPid(m[1]);
+    if (/^\d+$/.test(s)) return byPort(s) || byPid(s);
+    const needle = s.toLowerCase();
+    return entries.find(e => (e.folders || []).some(f => String(f).toLowerCase().includes(needle))) || null;
+}
+
+function probeInstance(port, timeoutMs) {
+    return new Promise((resolve) => {
+        const body = JSON.stringify({
+            jsonrpc: '2.0', id: 1, method: 'initialize',
+            params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'vscode-mcp-registry', version: '0' } },
+        });
+        const req = http.request({
+            host: '127.0.0.1', port, path: '/mcp', method: 'POST', timeout: timeoutMs || 1200,
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => {
+                try {
+                    const reply = JSON.parse(data);
+                    const inst = reply && reply.result && reply.result.serverInfo && reply.result.serverInfo.instance;
+                    resolve(inst ? { reachable: true, ...inst } : { reachable: true });
+                } catch (e) { resolve({ reachable: true }); }
+            });
+        });
+        req.on('timeout', () => { req.destroy(); resolve({ reachable: false, reason: 'timeout' }); });
+        req.on('error', (e) => resolve({ reachable: false, reason: e.code || e.message }));
+        req.end(body);
+    });
+}
+
+function forwardTo(entry, msg, timeoutMs) {
+    return new Promise((resolve) => {
+        const body = JSON.stringify(msg);
+        const req = http.request({
+            host: entry.host || '127.0.0.1', port: entry.port, path: '/mcp', method: 'POST', timeout: timeoutMs || 60000,
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch (e) { resolve(rpcError(msg.id, -32603, 'window ' + entry.port + ' answered non-JSON')); }
+            });
+        });
+        req.on('timeout', () => { req.destroy(); resolve(rpcError(msg.id, -32603, 'forwarded call to window ' + entry.port + ' timed out')); });
+        req.on('error', (e) => resolve(rpcError(msg.id, -32603, 'forwarding to window ' + entry.port + ' failed: ' + (e.code || e.message))));
+        req.end(body);
+    });
+}
 
 function cap(text, limit) {
     const n = limit || MAX_TEXT;
@@ -146,7 +260,7 @@ function instanceInfo() {
     return {
         pid: process.pid,
         vscode: vscode.version,
-        port: config.get('port', 9560),
+        port: boundPort || config.get('port', 9560),
         workspace_folders: (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath),
         window_count: vscode.window.tabGroups.all.length ? 1 : 0, // this extension host serves exactly one window
         view_columns: columns,
@@ -1643,11 +1757,12 @@ const TOOLS = [
     {
         name: 'install_extension',
         description: 'Installs an extension with VS Code\'s own CLI: from the marketplace by id (publisher.name), or from a .vsix file already downloaded (give vsix: path) - that skips the marketplace round trip, which is the slowest part of a test round. The command "workbench.extensions.installExtension" is not used: it opens a "Do you trust the publisher?" dialog that nothing can answer. The running window may list the new extension only after a reload (run_command workbench.action.reloadWindow).',
-        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids installed by ONE CLI process (much faster than one call each); results holds ok and version per id.' }, vsix: { type: 'string', description: 'Absolute path to a .vsix on disk (e.g. the file a triage download already produced). Takes precedence over id/ids.' } } },
+        inputSchema: { type: 'object', properties: { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: 'Several ids installed by ONE CLI process (much faster than one call each); results holds ok and version per id.' }, vsix: { type: 'string', description: 'Absolute path to a .vsix on disk (e.g. the file a triage download already produced). Takes precedence over id/ids.' }, remote: { type: 'string', description: 'Install into a remote target instead of this machine, as the CLI knows it: "wsl+Ubuntu", "ssh-remote+host". The extension then runs in the remote extension host, which is the only way a remote window gets it.' } } },
         run: async (a) => {
+            const remoteArgs = a.remote ? ['--remote', String(a.remote)] : [];
             if (a.vsix) {
                 const p = String(a.vsix);
-                const out = await runCli(['--install-extension', p, '--force']);
+                const out = await runCli(['--install-extension', p, '--force', ...remoteArgs]);
                 // For a .vsix the CLI names the FILE, not the extension id: "Extension 'ext.vsix' was successfully installed".
                 const m = /Extension '([^']+)' was successfully installed/i.exec(out);
                 return { ok: !!m, vsix: p, cli_says: m ? m[1] : '', note: 'the CLI reports the file name for a .vsix; confirm the id with list_extensions after a reload', cli: out.trim() };
@@ -1679,6 +1794,30 @@ const TOOLS = [
             const results = {};
             for (const id of ids) results[id] = { ok: new RegExp("Extension '" + escapeRe(id) + "' was successfully uninstalled", 'i').test(out), still_listed: !!vscode.extensions.getExtension(id) };
             return { ok: ids.every((id) => results[id].ok), results, cli: out.trim(), still_listed: ids.length === 1 ? results[ids[0]].still_listed : undefined };
+        },
+    },
+    {
+        name: 'instances',
+        description: 'Every VS Code window running vscode-mcp on this machine, from a registry each instance writes to the temp folder (pid, port, VSCode version, workspace folders) - including windows this client is not mounted on, such as a plain second window or a remote WSL/SSH window whose extension host runs elsewhere. Pass the port, "pid:<n>" or a workspace-folder substring as {"window": ...} to ANY tool call and it runs in that window instead of this one; the answer comes back through this server.',
+        inputSchema: { type: 'object', properties: { probe: { type: 'boolean', description: 'default true: POST initialize to each foreign port to prove it answers' } } },
+        run: async (a) => {
+            const mine = selfEntry();
+            const others = liveEntries().filter(e => e.pid !== process.pid).map(e => ({ ...e, self: false }));
+            if (a.probe !== false) {
+                for (const e of others) {
+                    const probe = await probeInstance(e.port);
+                    e.reachable = probe.reachable;
+                    if (!probe.reachable) e.reason = probe.reason;
+                    else if (probe.workspace_folders) e.folders = probe.workspace_folders;
+                }
+            }
+            return {
+                self: mine,
+                others,
+                count: 1 + others.length,
+                registry_file: REGISTRY_FILE,
+                usage: '{"window": <port | "pid:<n>" | folder substring>} on any tool call, including inside batch',
+            };
         },
     },
     {
@@ -2030,6 +2169,31 @@ async function handleRpc(msg) {
             return rpcError(id, -32602, 'unknown tool ' + name + ' - find it with discover({"query":"<words>"}) or '
                 + 'discover({"category":"hand-written"}), then call it through batch');
         }
+        // A call may name another window: run it there instead. The forwarded copy carries no window
+        // argument, so it cannot bounce back and forth.
+        const rawArgs = (params && params.arguments) || {};
+        if (rawArgs.window !== undefined && rawArgs.window !== null) {
+            const target = instanceFor(rawArgs.window);
+            if (!target) {
+                // Not in the registry: a window whose registry this process cannot see - a remote
+                // extension host in WSL or on another machine. A port or host:port is enough to try.
+                const spec = String(rawArgs.window).trim();
+                const m = /^(?:https?:\/\/)?([A-Za-z0-9_.-]+):(\d+)$/.exec(spec) || /^(\d+)$/.exec(spec);
+                const rest0 = { ...rawArgs };
+                delete rest0.window;
+                if (m) {
+                    const host = m[2] === undefined ? '127.0.0.1' : m[1];
+                    const port = Number(m[2] === undefined ? m[1] : m[2]);
+                    return forwardTo({ port, host }, { ...msg, params: { ...params, arguments: rest0 } });
+                }
+                return rpcError(id, -32602, 'no window matches ' + JSON.stringify(rawArgs.window)
+                    + ' - call instances to list the windows this machine has, or give a port or host:port');
+            }
+            const rest = { ...rawArgs };
+            delete rest.window;
+            if (!target.self) return forwardTo(target, { ...msg, params: { ...params, arguments: rest } });
+            params.arguments = rest;
+        }
         // Dispatch is by name over the whole catalogue, not over the presented list: a tool that
         // discover found must run whether or not the client was told about it.
         try {
@@ -2071,7 +2235,10 @@ function describePortSquatter(port, bind, output) {
 
 function startServer(output) {
     const config = vscode.workspace.getConfiguration('vscodeMcp');
-    const port = config.get('port', 9560);
+    const wanted = Number(config.get('port', 9560)) || 9560;
+    const fallback = config.get('portFallback', true) !== false;
+    const candidates = fallback ? Array.from({ length: 21 }, (_, i) => wanted + i) : [wanted];
+    let attempt = 0;
     const bind = config.get('bind', '127.0.0.1');
     const srv = http.createServer((req, res) => {
         // No browser pages: a page on the web must not be able to drive the editor. A Host header that is a
@@ -2109,18 +2276,33 @@ function startServer(output) {
             res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(batch ? replies : replies[0]));
         });
     });
+    const tryListen = () => {
+        const port = candidates[attempt];
+        srv.listen(port, bind, () => {
+            boundPort = port;
+            registerSelf();
+            output.appendLine('listening on http://' + bind + ':' + port + '/mcp'
+                + (port !== wanted ? ' (configured ' + wanted + ' was taken; ' + process.pid + ' took the next free one)' : ''));
+            statusItem.text = '$(plug) MCP ' + port;
+            statusItem.tooltip = 'vscode-mcp listening on http://' + bind + ':' + port + '/mcp (pid ' + process.pid + ')';
+        });
+    };
     srv.on('error', (e) => {
+        if (e.code === 'EADDRINUSE' && attempt < candidates.length - 1) {
+            attempt++;
+            tryListen();
+            return;
+        }
+        boundPort = null;
         output.appendLine('server error: ' + e.message);
         statusItem.text = '$(error) MCP';
-        const detail = e.code === 'EADDRINUSE' ? ' - another process or VS Code window holds this port; close it or set vscodeMcp.port' : '';
+        const detail = e.code === 'EADDRINUSE'
+            ? ' - every port from ' + candidates[0] + ' to ' + candidates[candidates.length - 1] + ' is taken; close a window or set vscodeMcp.port'
+            : '';
         statusItem.tooltip = 'vscode-mcp: ' + e.message + detail;
-        if (e.code === 'EADDRINUSE') describePortSquatter(port, bind, output);
+        if (e.code === 'EADDRINUSE') describePortSquatter(candidates[attempt], bind, output);
     });
-    srv.listen(port, bind, () => {
-        output.appendLine('listening on http://' + bind + ':' + port + '/mcp');
-        statusItem.text = '$(plug) MCP ' + port;
-        statusItem.tooltip = 'vscode-mcp listening on http://' + bind + ':' + port + '/mcp';
-    });
+    tryListen();
     return srv;
 }
 
@@ -2199,6 +2381,8 @@ function activate(context) {
 
 function deactivate() {
     if (server) server.close();
+    boundPort = null;
+    unregisterSelf();
 }
 
 // handleRpc and TOOLS are exported so a plain Node process can drive the protocol without a

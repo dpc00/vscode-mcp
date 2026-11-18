@@ -36,7 +36,7 @@
         "vscodeMcp.port": {
           "type": "number",
           "default": 9560,
-          "description": "Loopback port of the MCP server (http://127.0.0.1:<port>/mcp). Restart the server after changing it."
+          "description": "First port the MCP server tries (http://127.0.0.1:<port>/mcp). With vscodeMcp.portFallback on, a window whose port is already taken moves to the next free one, so several windows can run this server at once. Restart the server after changing it."
         },
         "vscodeMcp.extensionsDir": {
           "type": "string",
@@ -52,6 +52,11 @@
           "type": "boolean",
           "default": false,
           "description": "Present every tool in tools/list instead of the core surface plus discover. Off by default: the full list is thousands of tool schemas (one per VS Code command id) and fills a limited-context client before the first message, leaving no room to compact. A client that refuses a tool it was not told about does not need this - batch is always listed and runs any tool by name."
+        },
+        "vscodeMcp.portFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the configured port is already bound by another window, take the next free port instead of failing (9561, 9562, ...). Off keeps the port pinned, which is what a client that mounts one fixed port wants."
         }
       }
     }
